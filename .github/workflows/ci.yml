@@ -99,23 +99,18 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - name: all-users Python 3.12 (the installer refuses per-user ones)
         shell: pwsh
+        # The runner's Python lives in a folder ordinary users can modify, which the
+        # installer rightly refuses. Copy it under Program Files (admin-only ACL).
         run: |
           $ErrorActionPreference = 'Stop'
-          $log = Join-Path $env:RUNNER_TEMP 'python-install.log'
-          trap {
-            $msg = ($_ | Out-String)
-            if (Test-Path $log) { $msg += "`n--- installer log (end) ---`n" + ((Get-Content $log -Tail 40) -join "`n") }
-            $msg | Set-Content py.log; python .github/annotate.py "Python setup" py.log 80; exit 1
-          }
-          $exe = Join-Path $env:RUNNER_TEMP 'python-3.12.10-amd64.exe'
-          Invoke-WebRequest -UseBasicParsing https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe -OutFile $exe
           $target = Join-Path $env:ProgramFiles 'Python312'
-          $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '/quiet', '/log', "`"$log`"", 'InstallAllUsers=1', 'Include_test=0', 'PrependPath=0', "`"TargetDir=$target`""
-          if ($p.ExitCode -ne 0) { throw "Python installer exited with $($p.ExitCode)" }
-          if (-not (Test-Path (Join-Path $target 'python.exe'))) { throw "python.exe not found in $target" }
-          & (Join-Path $target 'python.exe') --version
+          Copy-Item -Recurse -Force $env:pythonLocation $target
+          & (Join-Path $target 'python.exe') -c "import sys, venv, ensurepip; print(sys.version)"
       - name: install
         shell: pwsh
         run: |
