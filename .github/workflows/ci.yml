@@ -16,17 +16,22 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install --disable-pip-version-check cryptography
-      - run: python -I tests/test_ai_dlp.py
+      - name: unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -I tests/test_ai_dlp.py 2>&1 | tee test.log \
+            || { python .github/annotate.py "unit tests (${{ matrix.os }})" test.log 80; exit 1; }
 
   shell-scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: bash syntax
         run: |
           for f in linux/install.sh linux/uninstall.sh linux/ai-dlp linux/merge-secrets \
@@ -41,7 +46,7 @@ jobs:
   powershell:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: PowerShell syntax
         shell: pwsh
         run: |
@@ -61,20 +66,27 @@ jobs:
   install-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install
-        run: sudo env AI_DLP_SKIP_TRUST=1 ./macos/install.sh
+        run: |
+          set -o pipefail
+          sudo env AI_DLP_SKIP_TRUST=1 ./macos/install.sh 2>&1 | tee install.log \
+            || { python3 .github/annotate.py "macOS install" install.log; exit 1; }
       - name: check the installed result
         run: |
-          set -e
-          ai-dlp domains | grep -q 'inspected      anthropic.com'
-          sudo /Library/ai-dlp/venv/bin/python -I "/Library/Application Support/ai-dlp/make_ca.py" --verify \
-            "/Library/Application Support/ai-dlp/ca.pem" "/Library/Application Support/ai-dlp/domains.txt"
-          plutil -lint /Library/LaunchDaemons/dev.ai-dlp.proxy.plist
-          /Library/ai-dlp/bin/gitleaks version
-          /Library/ai-dlp/venv/bin/mitmdump --version | head -1
-          test "$(stat -f %Su /Library/ai-dlp/venv/bin/python)" = root
-          sudo test "$(stat -f %Lp "/Library/Application Support/ai-dlp/state/mitmproxy-ca.pem")" = 600
+          set -o pipefail
+          {
+            set -ex
+            ai-dlp domains | grep -q 'inspected      anthropic.com'
+            sudo /Library/ai-dlp/venv/bin/python -I "/Library/Application Support/ai-dlp/make_ca.py" --verify \
+              "/Library/Application Support/ai-dlp/ca.pem" "/Library/Application Support/ai-dlp/domains.txt"
+            plutil -lint /Library/LaunchDaemons/dev.ai-dlp.proxy.plist
+            /Library/ai-dlp/bin/gitleaks version
+            /Library/ai-dlp/venv/bin/mitmdump --version | head -1
+            test "$(stat -f %Su /Library/ai-dlp/venv/bin/python)" = root
+            test "$(sudo stat -f %Lp "/Library/Application Support/ai-dlp/state/mitmproxy-ca.pem")" = 600
+          } > check.log 2>&1 || { cat check.log; python3 .github/annotate.py "macOS checks" check.log; exit 1; }
+          cat check.log
       - name: re-run is idempotent and keeps the CA
         run: |
           sudo env AI_DLP_SKIP_TRUST=1 ./macos/install.sh | grep -q 'ca: kept'
@@ -86,7 +98,7 @@ jobs:
   install-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: all-users Python 3.12 (the installer refuses per-user ones)
         shell: pwsh
         run: |
@@ -95,7 +107,14 @@ jobs:
           Start-Process -Wait -FilePath $exe -ArgumentList '/quiet', 'InstallAllUsers=1', 'Include_test=0', 'PrependPath=0', "TargetDir=$env:ProgramFiles\Python312"
       - name: install
         shell: pwsh
-        run: .\windows\install.ps1 -Python "$env:ProgramFiles\Python312\python.exe"
+        run: |
+          try {
+            .\windows\install.ps1 -Python "$env:ProgramFiles\Python312\python.exe" *>&1 | Tee-Object -FilePath install.log
+          } catch {
+            ($_ | Out-String) + ($_.ScriptStackTrace | Out-String) | Add-Content install.log
+            python .github/annotate.py "Windows install" install.log
+            exit 1
+          }
       - name: check the installed result
         shell: pwsh
         run: |
