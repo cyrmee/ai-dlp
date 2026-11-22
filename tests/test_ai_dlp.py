@@ -250,9 +250,10 @@ class RedactTests(unittest.TestCase):
     def test_secret_list_reloads_on_change(self):
         a, b = rnd(16), rnd(16)
         SECRETS.write_text(a + "\n")
+        os.utime(SECRETS, (1_000_000, 1_000_000))
         self.assertEqual(self.secrets.current(), [a])
-        os.utime(SECRETS, (1, 1))
         SECRETS.write_text(b + "\n")
+        os.utime(SECRETS, (2_000_000, 2_000_000))  # distinct times: Windows clocks can tick every ~15 ms
         self.assertEqual(self.secrets.current(), [b])
 
 
@@ -449,10 +450,11 @@ class DomainTests(unittest.TestCase):
 
     def test_list_reloads_on_change(self):
         DOMAINS.write_text("anthropic.com\n")
+        os.utime(DOMAINS, (1_000_000, 1_000_000))
         d = dlp.DomainList(DOMAINS)
         self.assertFalse(d.matches("chatgpt.com"))
-        os.utime(DOMAINS, (1, 1))
         DOMAINS.write_text("anthropic.com\nchatgpt.com\n")
+        os.utime(DOMAINS, (2_000_000, 2_000_000))  # distinct times: Windows clocks can tick every ~15 ms
         self.assertTrue(d.matches("chatgpt.com"))
 
     def test_domains_the_ca_does_not_cover_are_passed_through(self):

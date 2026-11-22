@@ -8,7 +8,7 @@ title = "ai-dlp"
 [extend]
 useDefault = true
 
-# scheme://user:PASSWORD@host  (e.g. postgres://app:hunter2xyz@db:5432/app)
+# scheme://user:PASSWORD@host  (e.g. postgres://app:<password>@db:5432/app)
 # Placeholders such as ${DB_PASS} or <password> are not matched.
 [[rules]]
 id = "url-password"
@@ -17,7 +17,7 @@ regex = '''(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@"'\\]{1,64}:([^\s@/"'\\$<>{}]{3,
 secretGroup = 1
 keywords = ["://"]
 
-# password = "Summer2024!", DB_PASSWORD=..., secret: ..., client_secret: ...
+# password = "<value>", DB_PASSWORD=<value>, secret: <value>, client_secret: <value>
 # Quoted values, or unquoted values that end the line. ${VAR} references and code
 # such as `password = request.getPassword();` are not matched.
 [[rules]]

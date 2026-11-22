@@ -104,7 +104,11 @@ jobs:
         run: |
           $exe = Join-Path $env:RUNNER_TEMP 'python-3.12.10-amd64.exe'
           Invoke-WebRequest -UseBasicParsing https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe -OutFile $exe
-          Start-Process -Wait -FilePath $exe -ArgumentList '/quiet', 'InstallAllUsers=1', 'Include_test=0', 'PrependPath=0', "TargetDir=$env:ProgramFiles\Python312"
+          $target = Join-Path $env:ProgramFiles 'Python312'
+          $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '/quiet', 'InstallAllUsers=1', 'Include_test=0', 'PrependPath=0', "`"TargetDir=$target`""
+          if ($p.ExitCode -ne 0) { throw "Python installer exited with $($p.ExitCode)" }
+          if (-not (Test-Path (Join-Path $target 'python.exe'))) { throw "python.exe not found in $target" }
+          & (Join-Path $target 'python.exe') --version
       - name: install
         shell: pwsh
         run: |
@@ -119,6 +123,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          trap { ($_ | Out-String) | Set-Content check.log; python .github/annotate.py "Windows checks" check.log; exit 1 }
           $out = & "$env:ProgramFiles\ai-dlp\ai-dlp.ps1" domains
           if (-not ($out -match 'inspected\s+anthropic.com')) { throw "domains: $out" }
           if (-not (Get-ChildItem Cert:\LocalMachine\Root | Where-Object Subject -like '*ai-dlp local inspection CA*')) { throw 'CA not trusted' }
