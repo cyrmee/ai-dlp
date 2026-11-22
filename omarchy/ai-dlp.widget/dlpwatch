@@ -1,0 +1,195 @@
+#!/usr/bin/python3 -I
+"""Feed for the ai-dlp bar widget.
+
+  dlpwatch watch   stream one JSON state object per line whenever something changes
+  dlpwatch status  print the current state once
+
+State: {installed, proxy, firewall, counts: {allowed, redacted, blocked, attachments} (today),
+        recent: [newest-first events, at most RECENT], error}
+
+Only reads the proxy's event log (action, host, path, rule names and counts;
+it never contains secret values) and asks systemd whether the units are active.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+
+EVENTS = Path(os.environ.get("AI_DLP_EVENTS", "/var/log/ai-dlp/events.jsonl"))
+ROTATED = EVENTS.with_name(EVENTS.name + ".1")
+RECENT = 40
+POLL = 0.5
+STATUS_EVERY = 5.0
+ACTIONS = ("allowed", "redacted", "blocked")
+
+
+def bounded(value, limit):
+    return str(value if value is not None else "")[:limit]
+
+
+def clean(event):
+    """Keep only known fields, bounded, from an untrusted log line."""
+    if not isinstance(event, dict) or event.get("action") not in ACTIONS:
+        return None
+    rules = event.get("rules") if isinstance(event.get("rules"), dict) else {}
+    attachments = event.get("attachments") if isinstance(event.get("attachments"), list) else []
+    return {
+        "time": int(event.get("time") or 0),
+        "action": event["action"],
+        "host": bounded(event.get("host"), 253),
+        "method": bounded(event.get("method"), 10),
+        "path": bounded(event.get("path"), 200),
+        "bytes": max(0, int(event.get("bytes") or 0)),
+        "rules": {bounded(k, 64): max(0, int(v or 0)) for k, v in list(rules.items())[:20]},
+        "reason": bounded(event.get("reason"), 200),
+        "test": event.get("test") is True,
+        "attachments": [
+            {"kind": bounded(a.get("kind"), 16), "media": bounded(a.get("media"), 80),
+             "bytes": max(0, int(a.get("bytes") or 0)), "name": bounded(a.get("name"), 120),
+             "source": bounded(a.get("source"), 20)}
+            for a in attachments[:20] if isinstance(a, dict)
+        ],
+    }
+
+
+def parse(line):
+    try:
+        return clean(json.loads(line))
+    except (ValueError, TypeError):
+        return None
+
+
+def unit_state(unit):
+    try:
+        out = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def installed():
+    return Path("/etc/systemd/system/ai-dlp-proxy.service").exists()
+
+
+class Feed:
+    def __init__(self):
+        self.recent = []
+        self.counts = {**dict.fromkeys(ACTIONS, 0), "attachments": 0}
+        self.day = date.today()
+        self.proxy = self.firewall = "unknown"
+        self.error = ""
+        self.handle = None
+        self.inode = None
+        self.buffer = ""
+
+    def add(self, event):
+        if event is None:
+            return
+        if datetime.fromtimestamp(event["time"] / 1000).date() == self.day:
+            self.counts[event["action"]] += 1
+            if not event["test"]:
+                self.counts["attachments"] += len(event["attachments"])
+        self.recent.insert(0, event)
+        del self.recent[RECENT:]
+
+    def load_history(self):
+        lines = []
+        for path in (ROTATED, EVENTS):
+            try:
+                lines += path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                pass
+        for line in lines:
+            self.add(parse(line))
+
+    def open_log(self, seek_end):
+        try:
+            handle = EVENTS.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            self.handle, self.inode = None, None
+            return
+        if seek_end:
+            handle.seek(0, os.SEEK_END)
+        self.handle, self.inode, self.buffer = handle, os.fstat(handle.fileno()).st_ino, ""
+
+    def poll_log(self):
+        """Read new lines; reopen after rotation. Returns True if anything was added."""
+        changed = False
+        try:
+            st = EVENTS.stat()
+        except OSError:
+            st = None
+        if self.handle is None:
+            if st is not None:
+                self.open_log(seek_end=False)
+        elif st is None or st.st_ino != self.inode or st.st_size < self.handle.tell():
+            self.handle.close()
+            self.open_log(seek_end=False)
+        if self.handle is not None:
+            chunk = self.handle.read(1_000_000)
+            if chunk:
+                self.buffer += chunk
+                *complete, self.buffer = self.buffer.split("\n")
+                for line in complete:
+                    event = parse(line)
+                    if event:
+                        self.add(event)
+                        changed = True
+        if date.today() != self.day:
+            self.day, self.counts = date.today(), {**dict.fromkeys(ACTIONS, 0), "attachments": 0}
+            changed = True
+        return changed
+
+    def poll_status(self):
+        before = (self.proxy, self.firewall, self.error)
+        if installed():
+            self.proxy, self.firewall = unit_state("ai-dlp-proxy"), unit_state("ai-dlp-firewall")
+            self.error = "" if EVENTS.parent.exists() or self.proxy != "active" else "event log missing"
+        else:
+            self.proxy = self.firewall = "missing"
+            self.error = ""
+        return (self.proxy, self.firewall, self.error) != before
+
+    def state(self):
+        return {"installed": self.proxy != "missing", "proxy": self.proxy, "firewall": self.firewall,
+                "counts": self.counts, "recent": self.recent, "error": self.error}
+
+
+def emit(feed):
+    sys.stdout.write(json.dumps(feed.state()) + "\n")
+    sys.stdout.flush()
+
+
+def main(argv):
+    mode = argv[0] if argv else "status"
+    feed = Feed()
+    feed.load_history()
+    feed.poll_status()
+    if mode == "status":
+        emit(feed)
+        return 0
+    if mode != "watch":
+        print(__doc__, file=sys.stderr)
+        return 2
+    feed.open_log(seek_end=True)
+    emit(feed)
+    last_status = time.monotonic()
+    try:
+        while True:
+            time.sleep(POLL)
+            changed = feed.poll_log()
+            if time.monotonic() - last_status >= STATUS_EVERY:
+                last_status = time.monotonic()
+                changed |= feed.poll_status()
+            if changed:
+                emit(feed)
+    except (BrokenPipeError, KeyboardInterrupt):
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

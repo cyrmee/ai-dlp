@@ -1,0 +1,63 @@
+{
+  "title": "AI DLP",
+  "state.on": "Inspecting",
+  "state.off": "Off",
+  "state.proxyDown": "Proxy down",
+  "state.missing": "Not installed",
+  "state.unknown": "Checking…",
+  "state.switching": "Waiting for authentication…",
+  "detail.on": "Secrets are redacted and images/PDFs flagged before anything reaches the listed AI services.",
+  "detail.off": "AI traffic is not scanned. Turn on to route HTTPS through the proxy.",
+  "detail.proxyDown": "Routing is on but the proxy is not running, so HTTPS from your apps cannot connect.",
+  "detail.missing": "Install with: sudo ./linux/install.sh (from the ai-dlp repository)",
+  "hint.on": "Turn inspection on",
+  "hint.off": "Turn inspection off (AI traffic goes out unscanned)",
+  "counts.title": "Today",
+  "count.allowed": "Allowed",
+  "count.redacted": "Redacted",
+  "count.blocked": "Blocked",
+  "action.allowed": "Allowed",
+  "action.redacted": "Redacted",
+  "action.blocked": "Blocked",
+  "action.test": "Test",
+  "recent.title": "Recent",
+  "recent.empty": "Requests to Anthropic show up here as they happen.",
+  "ago.now": "just now",
+  "ago.s": "%1 s ago",
+  "ago.m": "%1 min ago",
+  "ago.h": "%1 h ago",
+  "ago.d": "%1 d ago",
+  "size.kb": "%1 KB",
+  "size.mb": "%1 MB",
+  "notify.redacted": "Secrets redacted",
+  "notify.redactedBody": "%1 → %2",
+  "notify.blocked": "Request to Anthropic blocked",
+  "error.toggleFailed": "Could not change routing.",
+  "count.attachments": "Images/PDFs",
+  "kind.image": {
+    "one": "%1 image",
+    "other": "%1 images"
+  },
+  "kind.pdf": {
+    "one": "%1 PDF",
+    "other": "%1 PDFs"
+  },
+  "kind.document": {
+    "one": "%1 document",
+    "other": "%1 documents"
+  },
+  "kind.file": {
+    "one": "%1 file",
+    "other": "%1 files"
+  },
+  "kind.image.label": "Image",
+  "kind.pdf.label": "PDF",
+  "kind.document.label": "Document",
+  "kind.file.label": "File",
+  "notify.attachments": "Claude was sent files it can't scan",
+  "detail.redacted": "Redacted: %1",
+  "recent.emptyFlagged": "No redactions, blocks or attachments yet.",
+  "filter.all": "ALL",
+  "filter.flagged": "FLAGGED",
+  "filter.hint": "Show all requests or only flagged ones (A)"
+}

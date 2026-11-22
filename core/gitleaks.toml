@@ -1,0 +1,27 @@
+# ai-dlp detection rules: the full gitleaks default rule set, plus extras for
+# secrets gitleaks' defaults let through (low-entropy passwords, URL credentials).
+# Add your own rules below in standard gitleaks format; the proxy reloads this
+# file automatically when it changes.
+
+title = "ai-dlp"
+
+[extend]
+useDefault = true
+
+# scheme://user:PASSWORD@host  (e.g. postgres://app:hunter2xyz@db:5432/app)
+# Placeholders such as ${DB_PASS} or <password> are not matched.
+[[rules]]
+id = "url-password"
+description = "Password embedded in a connection URL"
+regex = '''(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@"'\\]{1,64}:([^\s@/"'\\$<>{}]{3,128})@'''
+secretGroup = 1
+keywords = ["://"]
+
+# password = "Summer2024!", DB_PASSWORD=..., secret: ..., client_secret: ...
+# Quoted values, or unquoted values that end the line. ${VAR} references and code
+# such as `password = request.getPassword();` are not matched.
+[[rules]]
+id = "password-assignment"
+description = "Password or secret assigned in config, env or code"
+regex = '''(?i)(?:password|passwd|pwd|secret)["']?[ \t]{0,3}[:=][ \t]{0,3}(?:"([^"\s$]{8,200})"|'([^'\s$]{8,200})'|([^\s"'$\{\(\);,]{8,200})(?:[\r\n]|$))'''
+keywords = ["password", "passwd", "pwd", "secret"]

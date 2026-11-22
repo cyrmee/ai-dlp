@@ -1,0 +1,48 @@
+#!/bin/bash
+# ai-dlp control script.
+set -uo pipefail
+
+CA=/etc/ai-dlp/ca.pem
+elevate() { if [[ -t 0 ]] && command -v sudo >/dev/null; then sudo "$@"; else pkexec "$@"; fi; }
+
+usage() {
+  cat <<'EOF'
+ai-dlp: redact secrets from everything sent to AI services
+
+  ai-dlp status        proxy + firewall state
+  ai-dlp domains       inspected domains, and whether the CA covers each
+  ai-dlp on            route all HTTPS through the proxy (listed domains are inspected)
+  ai-dlp off           stop routing (AI traffic goes out unscanned!)
+  ai-dlp test [--claude]  send fake secrets through the proxy and check they are redacted;
+                           --claude also checks a new Claude Code session can connect
+  ai-dlp log [-f]      redaction events (rule names + counts, never values)
+  ai-dlp add-secrets   add secret values to the exact-match list (see --help)
+EOF
+}
+
+cmd_status() {
+  printf 'proxy:    %s\n' "$(systemctl is-active ai-dlp-proxy)"
+  printf 'firewall: %s\n' "$(systemctl is-active ai-dlp-firewall)"
+  printf 'CA cert:  %s\n' "$([[ -r $CA ]] && echo "$CA" || echo missing)"
+  printf 'NODE_EXTRA_CA_CERTS in this shell: %s\n' "${NODE_EXTRA_CA_CERTS:-<not set>}"
+}
+
+TOOL=/etc/ai-dlp/aidlp_tool.py
+
+cmd_test() { python3 -I "$TOOL" selftest "$CA" "$@"; }
+cmd_domains() { python3 -I "$TOOL" domains /etc/ai-dlp/domains.txt "$CA"; }
+
+case ${1:-} in
+  status) cmd_status ;;
+  on)     elevate systemctl enable --now ai-dlp-proxy ai-dlp-firewall && cmd_status
+          echo
+          echo "All HTTPS from your apps now goes through the proxy; only the listed domains"
+          echo "(ai-dlp domains) are decrypted and inspected. AI apps started before the"
+          echo "current certificate was installed cannot connect: restart them." ;;
+  off)    elevate systemctl disable --now ai-dlp-firewall && cmd_status ;;
+  test)   shift; cmd_test "$@" ;;
+  domains) cmd_domains ;;
+  log)    shift; journalctl -u ai-dlp-proxy -o short-iso "$@" | grep -E 'ai-dlp|Traceback|Error' ;;
+  add-secrets) shift; exec /usr/local/bin/ai-dlp-secrets "$@" ;;
+  *)      usage ;;
+esac

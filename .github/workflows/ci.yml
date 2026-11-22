@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check cryptography
+      - run: python -I tests/test_ai_dlp.py
+
+  shell-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax
+        run: |
+          for f in linux/install.sh linux/uninstall.sh linux/ai-dlp linux/merge-secrets \
+                   macos/install.sh macos/uninstall.sh macos/ai-dlp; do
+            bash -n "$f" && echo "ok  $f"
+          done
+      - name: shellcheck (errors only)
+        run: |
+          shellcheck -S error linux/install.sh linux/uninstall.sh linux/ai-dlp linux/merge-secrets \
+                     macos/install.sh macos/uninstall.sh macos/ai-dlp
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem windows -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $failed = $true; $errors | ForEach-Object { Write-Host "$($f.Name): $($_.Message) (line $($_.Extent.StartLineNumber))" } }
+            else { Write-Host "ok  $($f.Name)" }
+          }
+          if ($failed) { exit 1 }
+
+  # Runs the real installers on GitHub's runners: downloads (pinned, checksum verified),
+  # Python + mitmproxy setup, the CA and its root-side check, service registration, the
+  # ai-dlp command, and the uninstaller. Capture itself is not started: macOS needs a
+  # person to approve the network extension, and CI must not divert the runner's traffic.
+  install-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: sudo env AI_DLP_SKIP_TRUST=1 ./macos/install.sh
+      - name: check the installed result
+        run: |
+          set -e
+          ai-dlp domains | grep -q 'inspected      anthropic.com'
+          sudo /Library/ai-dlp/venv/bin/python -I "/Library/Application Support/ai-dlp/make_ca.py" --verify \
+            "/Library/Application Support/ai-dlp/ca.pem" "/Library/Application Support/ai-dlp/domains.txt"
+          plutil -lint /Library/LaunchDaemons/dev.ai-dlp.proxy.plist
+          /Library/ai-dlp/bin/gitleaks version
+          /Library/ai-dlp/venv/bin/mitmdump --version | head -1
+          test "$(stat -f %Su /Library/ai-dlp/venv/bin/python)" = root
+          sudo test "$(stat -f %Lp "/Library/Application Support/ai-dlp/state/mitmproxy-ca.pem")" = 600
+      - name: re-run is idempotent and keeps the CA
+        run: |
+          sudo env AI_DLP_SKIP_TRUST=1 ./macos/install.sh | grep -q 'ca: kept'
+      - name: uninstall
+        run: |
+          sudo ./macos/uninstall.sh
+          test ! -e /Library/ai-dlp && test ! -e "/Library/Application Support/ai-dlp"
+
+  install-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: all-users Python 3.12 (the installer refuses per-user ones)
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'python-3.12.10-amd64.exe'
+          Invoke-WebRequest -UseBasicParsing https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe -OutFile $exe
+          Start-Process -Wait -FilePath $exe -ArgumentList '/quiet', 'InstallAllUsers=1', 'Include_test=0', 'PrependPath=0', "TargetDir=$env:ProgramFiles\Python312"
+      - name: install
+        shell: pwsh
+        run: .\windows\install.ps1 -Python "$env:ProgramFiles\Python312\python.exe"
+      - name: check the installed result
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = & "$env:ProgramFiles\ai-dlp\ai-dlp.ps1" domains
+          if (-not ($out -match 'inspected\s+anthropic.com')) { throw "domains: $out" }
+          if (-not (Get-ChildItem Cert:\LocalMachine\Root | Where-Object Subject -like '*ai-dlp local inspection CA*')) { throw 'CA not trusted' }
+          if ((Get-ScheduledTask -TaskName 'ai-dlp proxy').State -ne 'Disabled') { throw 'task should be installed but off' }
+          & "$env:ProgramFiles\ai-dlp\gitleaks\gitleaks.exe" version
+          & "$env:ProgramFiles\ai-dlp\venv\Scripts\mitmdump.exe" --version | Select-Object -First 1
+          $acl = (Get-Acl "$env:ProgramData\ai-dlp\state").Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+          if ($acl | Where-Object { $_ -notin 'S-1-5-18', 'S-1-5-32-544' }) { throw "state folder ACL too open: $acl" }
+      - name: uninstall
+        shell: pwsh
+        run: |
+          .\windows\uninstall.ps1
+          if (Test-Path "$env:ProgramFiles\ai-dlp") { throw 'not removed' }

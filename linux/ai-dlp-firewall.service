@@ -1,0 +1,14 @@
+[Unit]
+Description=ai-dlp: route traffic to Anthropic through the inspection proxy
+Wants=ai-dlp-proxy.service network-pre.target
+# Load before the network comes up so Anthropic is never reachable unscanned (fail closed).
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/ai-dlp/ai-dlp.nft
+ExecStop=/usr/bin/nft delete table inet ai_dlp
+
+[Install]
+WantedBy=multi-user.target

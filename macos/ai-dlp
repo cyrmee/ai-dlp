@@ -1,0 +1,51 @@
+#!/bin/bash
+# ai-dlp control command for macOS (EXPERIMENTAL).
+set -uo pipefail
+
+PREFIX=/Library/ai-dlp
+PY=$PREFIX/venv/bin/python
+CONF="/Library/Application Support/ai-dlp"
+LOGS=/Library/Logs/ai-dlp
+LABEL=dev.ai-dlp.proxy
+PLIST=/Library/LaunchDaemons/$LABEL.plist
+CA="$CONF/ca.pem"
+TOOL="$CONF/aidlp_tool.py"
+
+usage() {
+  cat <<'EOF'
+ai-dlp: redact secrets from everything sent to AI services
+
+  ai-dlp status              is the proxy running
+  ai-dlp domains             inspected domains, and whether the CA covers each
+  ai-dlp on                  start the proxy (captures all apps; listed domains are inspected)
+  ai-dlp off                 stop the proxy (AI traffic goes out unscanned!)
+  ai-dlp test [--claude]     check redaction, passthrough of other sites, and Claude Code
+  ai-dlp log                 follow redaction/block events
+  ai-dlp add-secrets FILE…   add secret values (.env files; --pgpass FILE; or stdin)
+EOF
+}
+
+as_root() { if [[ $EUID -ne 0 ]]; then exec sudo "$0" "$@"; fi; }
+
+case ${1:-} in
+  status)
+    if launchctl print "system/$LABEL" >/dev/null 2>&1; then echo "proxy: running (inspecting)"
+    else echo "proxy: stopped (AI traffic is NOT scanned)"; fi ;;
+  on)
+    as_root "$@"
+    launchctl enable "system/$LABEL"
+    launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl kickstart -k "system/$LABEL"
+    echo "proxy: started. Restart AI apps that were running before the CA was installed." ;;
+  off)
+    as_root "$@"
+    launchctl bootout "system/$LABEL" 2>/dev/null
+    launchctl disable "system/$LABEL"
+    echo "proxy: stopped (AI traffic is NOT scanned)" ;;
+  test)    shift; "$PY" -I "$TOOL" selftest "$CA" "$@" ;;
+  domains) "$PY" -I "$TOOL" domains "$CONF/domains.txt" "$CA" ;;
+  log)     tail -n 20 -F "$LOGS/events.jsonl" ;;
+  add-secrets)
+    as_root "$@"
+    shift; "$PY" -I "$TOOL" add-secrets "$CONF/secrets.txt" "$@" ;;
+  *) usage ;;
+esac

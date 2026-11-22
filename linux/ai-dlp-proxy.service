@@ -1,0 +1,34 @@
+[Unit]
+Description=ai-dlp: secret-redacting proxy for traffic to Anthropic
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ai-dlp
+Group=ai-dlp
+Environment=HOME=/var/lib/ai-dlp
+# Unbuffered, so mitmproxy messages (e.g. TLS handshake failures) reach the journal immediately.
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=ai-dlp
+StateDirectoryMode=0700
+LogsDirectory=ai-dlp
+LogsDirectoryMode=0755
+UMask=0022
+ExecStart=/usr/bin/mitmdump --mode transparent --listen-host 127.0.0.1 --listen-port 18443 \
+    --set confdir=/var/lib/ai-dlp --set flow_detail=0 --set termlog_verbosity=info \
+    -s /etc/ai-dlp/ai_dlp.py
+Restart=always
+RestartSec=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
