@@ -812,18 +812,72 @@ def _address_ip(conn) -> str | None:
 REQUESTS_DIR = Path(os.environ.get("AI_DLP_REQUESTS_DIR", LOG_DIR / "requests"))
 KEEP_REQUESTS = int(os.environ.get("AI_DLP_KEEP_REQUESTS", "0") or 0)
 REQUEST_MAX_BYTES = 1_000_000
-_SENSITIVE_HEADER = re.compile(r"auth|cookie|token|secret|key|session|password|credential|signature", re.I)
+# Only these headers keep their values in stored copies; every other header is shown as
+# [hidden] (login headers, cookies, and anything whose purpose is not known to be harmless).
+_SAFE_HEADERS = frozenset({
+    "host", "content-type", "content-length", "content-encoding", "accept", "accept-encoding",
+    "accept-language", "user-agent", "origin", "connection", "te", "priority", "cache-control",
+    "pragma", "dnt", "anthropic-version", "anthropic-beta", "openai-beta", "x-app",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-ch-ua", "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+})
+# Stored copies are kept only for this account (set by the installer): the proxy sees every
+# user's traffic, and no one should be able to read another user's requests.
+REQUESTS_UID = int(os.environ.get("AI_DLP_REQUESTS_UID", "-1") or -1)
 _REQUEST_ID = re.compile(r"^\d{13}-[0-9a-f]{8}$")
 _last_request_ms = 0
 
 
+def _proc_ip(hexaddr: str) -> str:
+    raw = bytes.fromhex(hexaddr)
+    if len(raw) == 4:
+        return socket.inet_ntoa(raw[::-1])
+    import ipaddress
+    addr = ipaddress.IPv6Address(b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4)))
+    return str(addr.ipv4_mapped or addr)
+
+
+def uid_from_proc(table: str, ip: str, port: int) -> int | None:
+    """The uid owning the socket whose local address is ip:port, from /proc/net/tcp(6) text."""
+    want_port = f"{port:04X}"
+    for line in table.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 8 or ":" not in cols[1]:
+            continue
+        addr, lport = cols[1].rsplit(":", 1)
+        if lport.upper() == want_port and cols[3] != "0A":  # 0A = listening
+            try:
+                if _proc_ip(addr) == ip:
+                    return int(cols[7])
+            except ValueError:
+                continue
+    return None
+
+
+def client_uid(flow) -> int | None:
+    """Which local account opened this connection (Linux; None if unknown)."""
+    peer = getattr(getattr(flow, "client_conn", None), "peername", None)
+    if not (isinstance(peer, tuple) and len(peer) >= 2):
+        return None
+    ip = str(peer[0]).removeprefix("::ffff:")
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            uid = uid_from_proc(Path(table).read_text(), ip, int(peer[1]))
+        except OSError:
+            continue
+        if uid is not None:
+            return uid
+    return None
+
+
 def safe_headers(fields, known: list[str]) -> list[list[str]]:
-    """Request headers fit to store: login headers masked, listed secrets redacted."""
+    """Request headers fit to store: values only for known-harmless headers (with listed
+    secrets redacted); every other header is [hidden]."""
     out = []
     for name, value in fields:
         name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
         value = value.decode("latin-1") if isinstance(value, bytes) else str(value)
-        if _SENSITIVE_HEADER.search(name):
+        if name.lower() not in _SAFE_HEADERS and not name.lower().startswith("x-stainless-"):
             value = "[hidden]"
         else:
             for secret in known:
@@ -971,16 +1025,20 @@ class AiDLP:
             return
         data.ignore_connection = True
 
-    @staticmethod
-    def _block(flow, reason: str) -> None:
+    def _may_store(self, flow) -> bool:
+        """Keep a copy only of requests from the account the installer gave access to."""
+        return KEEP_REQUESTS > 0 and REQUESTS_UID >= 0 and client_uid(flow) == REQUESTS_UID
+
+    def _block(self, flow, reason: str) -> None:
         body = json.dumps({"type": "error", "error": {
             "type": "invalid_request_error", "message": f"ai-dlp blocked this request: {reason}"}})
         flow.response = http.Response.make(400, body, {"content-type": "application/json"})
         req = flow.request
         rid = None
         try:  # headers only: a blocked body holds the secret that could not be removed
-            rid = store_request(req.method, req.pretty_host, req.path, safe_headers(req.headers.fields, []),
-                                None)
+            if self._may_store(flow):
+                rid = store_request(req.method, req.pretty_host, req.path,
+                                    safe_headers(req.headers.fields, self.secrets.current()), None)
         except Exception as e:
             log.warning("ai-dlp: could not store request details: %s", e)
         record_event("blocked", req.pretty_host, req.path, req.method, reason=reason,
@@ -1026,7 +1084,7 @@ class AiDLP:
             kinds = Counter(a["kind"] for a in attachments)
             log.warning("ai-dlp: flagged %s sent to %s", _summary(kinds), where)
         rid = None
-        if KEEP_REQUESTS > 0:
+        if self._may_store(flow):
             try:  # what actually left the machine: the redacted body
                 text, truncated = displayable_body(cleaned, req.headers.get("content-type", ""))
                 rid = store_request(req.method, req.pretty_host, req.path,

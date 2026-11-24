@@ -92,9 +92,14 @@ install -d -m 750 -o ai-dlp -g ai-dlp /var/log/ai-dlp/requests
 if [[ -n $owner && $owner != root ]] && command -v setfacl >/dev/null; then
   setfacl -m "u:$owner:rx" -d -m "u:$owner:r" /var/log/ai-dlp/requests
   find /var/log/ai-dlp/requests -type f -exec setfacl -m "u:$owner:r" {} +
-  echo "Readable by: ai-dlp, $owner"
+  # Only this account's own requests are kept (the proxy sees every user's traffic).
+  install -d -m 755 /etc/systemd/system/ai-dlp-proxy.service.d
+  printf '[Service]\nEnvironment=AI_DLP_REQUESTS_UID=%s\n' "$(id -u "$owner")" \
+    > /etc/systemd/system/ai-dlp-proxy.service.d/requests.conf
+  echo "Keeping request details for $owner only (readable by ai-dlp and $owner)"
 else
-  echo "NOTE: could not tell which user to give access; the widget will not show request details." >&2
+  rm -f /etc/systemd/system/ai-dlp-proxy.service.d/requests.conf
+  echo "NOTE: could not tell which user to give access; request details are not kept." >&2
 fi
 
 step "Starting the proxy"

@@ -12,6 +12,7 @@ if [[ -f /etc/ai-dlp/ca.pem ]]; then
 fi
 sed -i '\|^NODE_EXTRA_CA_CERTS=/etc/ai-dlp/ca.pem$|d' /etc/environment
 rm -f /etc/systemd/system/ai-dlp-proxy.service /etc/systemd/system/ai-dlp-firewall.service
+rm -rf /etc/systemd/system/ai-dlp-proxy.service.d
 systemctl daemon-reload
 rm -rf /etc/ai-dlp /var/lib/ai-dlp /usr/local/lib/ai-dlp /var/log/ai-dlp   # logs include stored request copies
 rm -f /usr/local/bin/ai-dlp /usr/local/bin/ai-dlp-secrets /etc/sysusers.d/ai-dlp.conf

@@ -828,24 +828,26 @@ class RequestStoreTests(unittest.TestCase):
         import shutil
         self.dir = TMP / "requests"
         shutil.rmtree(self.dir, ignore_errors=True)
-        self.saved = (dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS)
-        dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS = self.dir, 3
+        self.saved = (dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS, dlp.REQUESTS_UID, dlp.client_uid)
+        dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS, dlp.REQUESTS_UID = self.dir, 3, 1000
+        dlp.client_uid = lambda flow: 1000  # the request comes from the allowed account
         SECRETS.write_text("")
         EVENTS.unlink(missing_ok=True)
 
     def tearDown(self):
-        dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS = self.saved
+        dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS, dlp.REQUESTS_UID, dlp.client_uid = self.saved
 
     def test_login_headers_are_hidden_and_listed_secrets_redacted(self):
         fields = [(b"Host", b"api.anthropic.com"), (b"x-api-key", b"sk-real"), (b"Authorization", b"Bearer abc"),
                   (b"Cookie", b"sessionKey=xyz"), (b"anthropic-version", b"2023-06-01"),
-                  (b"x-note", b"pin Zebra7731 here")]
+                  (b"x-innocent-name", b"actually a secret"), (b"User-Agent", b"tool Zebra7731")]
         out = dict(dlp.safe_headers(fields, ["Zebra7731"]))
         self.assertEqual(out["x-api-key"], "[hidden]")
         self.assertEqual(out["Authorization"], "[hidden]")
         self.assertEqual(out["Cookie"], "[hidden]")
+        self.assertEqual(out["x-innocent-name"], "[hidden]")  # not on the allowlist
         self.assertEqual(out["anthropic-version"], "2023-06-01")
-        self.assertEqual(out["x-note"], "pin [REDACTED:known-secret] here")
+        self.assertEqual(out["User-Agent"], "tool [REDACTED:known-secret]")
 
     def test_body_is_pretty_printed_with_images_summarised(self):
         import base64 as b64
@@ -890,6 +892,26 @@ class RequestStoreTests(unittest.TestCase):
         self.assertEqual(ev["action"], "blocked")
         rec = json.loads((self.dir / f"{ev['id']}.json").read_text())
         self.assertIsNone(rec["body"])
+
+    def test_other_users_requests_are_not_stored(self):
+        dlp.client_uid = lambda flow: 1001
+        addon = dlp.AiDLP()
+        addon.ocr.tesseract = None
+        dlp.http = type("http", (), {"Response": AddonHookTests.FakeResponse})
+        req = AddonHookTests.Req("api.anthropic.com", body_of("hello there"))
+        req.headers.fields = [(b"content-type", b"application/json")]
+        run(addon.request(AddonHookTests.Flow(req)))
+        ev = json.loads(EVENTS.read_text().splitlines()[-1])
+        self.assertNotIn("id", ev)
+        self.assertFalse(self.dir.exists() and any(self.dir.iterdir()))
+
+    def test_socket_owner_is_read_from_proc(self):
+        table = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+                 "   0: 0100007F:4762 00000000:0000 0A 00000000:00000000 00:00000000 00000000   977        0 1\n"
+                 "   1: 8920A8C0:D431 0A684FA0:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2\n")
+        self.assertEqual(dlp.uid_from_proc(table, "192.168.32.137", 0xD431), 1000)
+        self.assertIsNone(dlp.uid_from_proc(table, "127.0.0.1", 0x4762))  # listening socket
+        self.assertIsNone(dlp.uid_from_proc(table, "10.0.0.1", 0xD431))
 
     def test_nothing_is_stored_when_capture_is_off(self):
         dlp.KEEP_REQUESTS = 0
