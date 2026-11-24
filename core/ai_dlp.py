@@ -486,8 +486,9 @@ class OCR:
                 if not wpx or not hpx or wpx * hpx > OCR_MAX_PIXELS:
                     raise ScanError(f"PDF page {n} is too large to check for secrets at {OCR_DPI} dpi")
                 out = Path(tmp) / f"p{n}"
-                # -W/-H cap the output at the size just checked, whatever the file claims.
-                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", str(OCR_DPI), "-cropbox",
+                # The full page (MediaBox), so content outside the CropBox is read too; -W/-H
+                # cap the output at the size just checked (the larger box), whatever the file claims.
+                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", str(OCR_DPI),
                                  "-x", "0", "-y", "0", "-W", str(wpx), "-H", str(hpx),
                                  "-png", "-singlefile", str(src), str(out)], None)
                 parts.append(await self._image(out.with_suffix(".png").read_bytes()))
