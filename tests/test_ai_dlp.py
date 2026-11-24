@@ -823,6 +823,80 @@ class HiddenNameTests(unittest.TestCase):
         self.assertTrue(self.addon._inspected(flow))
 
 
+class RequestStoreTests(unittest.TestCase):
+    def setUp(self):
+        import shutil
+        self.dir = TMP / "requests"
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.saved = (dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS)
+        dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS = self.dir, 3
+        SECRETS.write_text("")
+        EVENTS.unlink(missing_ok=True)
+
+    def tearDown(self):
+        dlp.REQUESTS_DIR, dlp.KEEP_REQUESTS = self.saved
+
+    def test_login_headers_are_hidden_and_listed_secrets_redacted(self):
+        fields = [(b"Host", b"api.anthropic.com"), (b"x-api-key", b"sk-real"), (b"Authorization", b"Bearer abc"),
+                  (b"Cookie", b"sessionKey=xyz"), (b"anthropic-version", b"2023-06-01"),
+                  (b"x-note", b"pin Zebra7731 here")]
+        out = dict(dlp.safe_headers(fields, ["Zebra7731"]))
+        self.assertEqual(out["x-api-key"], "[hidden]")
+        self.assertEqual(out["Authorization"], "[hidden]")
+        self.assertEqual(out["Cookie"], "[hidden]")
+        self.assertEqual(out["anthropic-version"], "2023-06-01")
+        self.assertEqual(out["x-note"], "pin [REDACTED:known-secret] here")
+
+    def test_body_is_pretty_printed_with_images_summarised(self):
+        import base64 as b64
+        img = b64.b64encode(os.urandom(3000)).decode()
+        text, truncated = dlp.displayable_body(json.dumps({"a": "hi", "img": img}).encode())
+        self.assertFalse(truncated)
+        self.assertIn('"a": "hi"', text)
+        self.assertIn("[base64 data, 2 KB]", text)
+        self.assertNotIn(img, text)
+        self.assertTrue(dlp.displayable_body(b"\x00\xff\xfe" + os.urandom(10), "audio/webm")[0].startswith("[binary body"))
+
+    def test_only_the_newest_requests_are_kept(self):
+        ids = [dlp.store_request("POST", "api.anthropic.com", f"/v1/m?key=SECRETQUERY{i}", [], "{}") for i in range(5)]
+        kept = sorted(f.stem for f in self.dir.glob("*.json"))
+        self.assertEqual(kept, sorted(ids[-3:]))
+        rec = json.loads((self.dir / f"{ids[-1]}.json").read_text())
+        self.assertEqual(rec["path"], "/v1/m")  # query (which can carry API keys) is dropped
+        if os.name == "posix":
+            self.assertEqual((self.dir / f"{ids[-1]}.json").stat().st_mode & 0o777, 0o640)
+
+    def test_flow_stores_the_redacted_body_and_links_the_event(self):
+        addon = dlp.AiDLP()
+        addon.ocr.tesseract = None
+        dlp.http = type("http", (), {"Response": AddonHookTests.FakeResponse})
+        aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
+        req = AddonHookTests.Req("api.anthropic.com", body_of(f"key {aws}"), {"x-api-key": "sk-ant-real"})
+        req.headers.fields = [(b"x-api-key", b"sk-ant-real"), (b"content-type", b"application/json")]
+        run(addon.request(AddonHookTests.Flow(req)))
+        ev = json.loads(EVENTS.read_text().splitlines()[-1])
+        rec = json.loads((self.dir / f"{ev['id']}.json").read_text())
+        self.assertNotIn(aws, rec["body"])
+        self.assertIn("[REDACTED:aws-access-token]", rec["body"])
+        self.assertEqual(dict(rec["headers"])["x-api-key"], "[hidden]")
+
+    def test_blocked_request_is_stored_without_its_body(self):
+        addon = dlp.AiDLP()
+        dlp.http = type("http", (), {"Response": AddonHookTests.FakeResponse})
+        req = AddonHookTests.Req("api.anthropic.com", body_of("FORCE_GITLEAKS_ERROR secret stuff"))
+        req.headers.fields = [(b"content-type", b"application/json")]
+        run(addon.request(AddonHookTests.Flow(req)))
+        ev = json.loads(EVENTS.read_text().splitlines()[-1])
+        self.assertEqual(ev["action"], "blocked")
+        rec = json.loads((self.dir / f"{ev['id']}.json").read_text())
+        self.assertIsNone(rec["body"])
+
+    def test_nothing_is_stored_when_capture_is_off(self):
+        dlp.KEEP_REQUESTS = 0
+        self.assertIsNone(dlp.store_request("POST", "h", "/", [], "{}"))
+        self.assertFalse(self.dir.exists())
+
+
 class SecretsCliTests(unittest.TestCase):
     def setUp(self):
         spec = importlib.util.spec_from_loader("cli", loader=None)

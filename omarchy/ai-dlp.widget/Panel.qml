@@ -23,8 +23,21 @@ Panel {
   readonly property color faint: Qt.darker(foreground, 1.9)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   property bool cursorActive: false
-  property bool showAllowed: dlp.showAllowedSetting
+  // "all", "flagged", or one category: "allowed", "redacted", "blocked", "attachments".
+  property string filter: dlp.showAllowedSetting ? "all" : "flagged"
+  // The request shown in the detail view (an event), or null for the lists.
+  property var detailEntry: null
   property double now: Date.now()
+
+  function setFilter(category) {
+    filter = filter === category ? "all" : category
+  }
+
+  function showDetail(entry) {
+    detailEntry = entry
+    dlp.loadDetail(entry.id)
+    scroller.contentY = 0
+  }
 
   readonly property string glyph: {
     if (dlp.status === "proxyDown") return "󰻌"   // shield-alert
@@ -38,8 +51,12 @@ Panel {
     proxyDown: strings.t("detail.proxyDown"), missing: strings.t("detail.missing")
   })[dlp.status] || ""
 
-  readonly property var visibleRecent: (showAllowed ? dlp.recent
-    : dlp.recent.filter(function(e) { return e.action !== "allowed" || e.attachments.length > 0 })).slice(0, 25)
+  readonly property var visibleRecent: dlp.recent.filter(function(e) {
+    if (filter === "all") return true
+    if (filter === "flagged") return e.action !== "allowed" || e.attachments.length > 0
+    if (filter === "attachments") return e.attachments.length > 0
+    return e.action === filter
+  }).slice(0, 25)
 
   function agoText(time) {
     var seconds = Math.max(0, Math.round((now - time) / 1000))
@@ -82,6 +99,7 @@ Panel {
 
   onOpenedChanged: if (opened) {
     cursorActive = false
+    detailEntry = null
     now = Date.now()
     dlp.refresh()
     Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
@@ -163,11 +181,14 @@ Panel {
         if (root.cursorActive) dlp.toggle()
         else root.cursorActive = true
       }
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (root.detailEntry !== null) root.detailEntry = null
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") dlp.refresh()
-        else if (t === "a" || t === "A") root.showAllowed = !root.showAllowed
+        else if (t === "a" || t === "A") root.filter = root.filter === "all" ? "flagged" : "all"
       }
 
       Flickable {
@@ -241,8 +262,15 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // ---------- Detail view of one request ----------
+          DetailView {
+            visible: root.detailEntry !== null
+            width: parent.width
+          }
+
           // ---------- Today ----------
           Column {
+            visible: root.detailEntry === null
             width: parent.width
             spacing: Style.space(8)
 
@@ -266,10 +294,11 @@ Panel {
             }
           }
 
-          PanelSeparator { foreground: root.foreground }
+          PanelSeparator { visible: root.detailEntry === null; foreground: root.foreground }
 
           // ---------- Recent requests ----------
           Column {
+            visible: root.detailEntry === null
             width: parent.width
             spacing: Style.space(4)
 
@@ -292,7 +321,7 @@ Panel {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 textFormat: Text.PlainText
-                text: root.showAllowed ? strings.t("filter.all") : strings.t("filter.flagged")
+                text: strings.t("filter." + root.filter)
                 color: filterMouse.containsMouse ? root.foreground : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -305,12 +334,12 @@ Panel {
                   anchors.margins: -Style.space(4)
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.showAllowed = !root.showAllowed
+                  onClicked: root.filter = root.filter === "all" ? "flagged" : "all"
                 }
 
                 PanelToolTip {
                   visible: filterMouse.containsMouse
-                  text: strings.t("filter.hint")
+                  text: root.filter === "all" || root.filter === "flagged" ? strings.t("filter.hint") : strings.t("filter.clear")
                   fontFamily: root.fontFamily
                 }
               }
@@ -320,7 +349,8 @@ Panel {
 
             Caption {
               visible: root.visibleRecent.length === 0
-              text: root.showAllowed ? strings.t("recent.empty") : strings.t("recent.emptyFlagged")
+              text: root.filter === "all" ? strings.t("recent.empty")
+                : (root.filter === "flagged" ? strings.t("recent.emptyFlagged") : strings.t("recent.emptyFiltered"))
               color: root.dim
             }
 
@@ -338,6 +368,131 @@ Panel {
     }
   }
 
+  // One request in full: what was sent (after redaction), its headers (login headers
+  // hidden) and its payload as selectable text, with the full copy one click away.
+  component DetailView: Column {
+    id: dv
+    readonly property var entry: root.detailEntry || ({})
+    readonly property var d: dlp.detail
+    spacing: Style.space(10)
+
+    RowLayout {
+      width: parent.width
+      spacing: Style.space(8)
+
+      PanelActionButton {
+        iconText: "󰁍"
+        tooltipText: strings.t("detail.back")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.detailEntry = null
+      }
+
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        text: (dv.entry.method ? dv.entry.method + " " : "") + (dv.entry.path || "/")
+        color: dv.entry.action === "allowed" ? root.foreground : root.toneFor(dv.entry.action)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        elide: Text.ElideMiddle
+      }
+
+      PanelActionButton {
+        visible: dv.d !== null && !!dv.d.file && !dv.d.error
+        iconText: "󰏌"
+        tooltipText: strings.t("detail.open")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: dlp.openFile(dv.d.file)
+      }
+    }
+
+    Caption {
+      text: [dv.entry.host, strings.t("action." + (dv.entry.action || "allowed")), root.agoText(dv.entry.time || 0)]
+        .concat(dv.entry.action === "blocked" && dv.entry.reason ? [dv.entry.reason] : [])
+        .concat(dv.entry.action === "redacted" ? [dlp.rulesText(dv.entry.rules)] : []).join(" · ")
+      color: root.dim
+    }
+
+    Caption {
+      visible: dlp.detailLoading || (dv.d !== null && dv.d.error !== "")
+      text: dlp.detailLoading ? strings.t("detail.loading") : (dv.d ? dv.d.error : "")
+      color: dlp.detailLoading ? root.dim : root.urgent
+    }
+
+    Column {
+      visible: dv.d !== null && !dv.d.error
+      width: parent.width
+      spacing: Style.space(6)
+
+      PanelSectionHeader {
+        text: strings.t("detail.headers")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+
+      Repeater {
+        model: dv.d && dv.d.headers ? dv.d.headers : []
+        Text {
+          required property var modelData
+          width: parent.width
+          textFormat: Text.PlainText
+          text: modelData[0] + ": " + modelData[1]
+          color: modelData[1] === "[hidden]" ? root.faint : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WrapAnywhere
+        }
+      }
+
+      Caption {
+        text: strings.t("detail.masked")
+        color: root.faint
+      }
+
+      Item { width: 1; height: Style.space(4) }
+
+      PanelSectionHeader {
+        text: strings.t("detail.payload")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+
+      Caption {
+        visible: dv.d !== null && (dv.d.body === null || dv.d.truncated)
+        text: dv.d && dv.d.body === null ? strings.t("detail.blockedBody") : strings.t("detail.truncated")
+        color: dv.d && dv.d.body === null ? root.urgent : root.dim
+      }
+
+      BorderSurface {
+        visible: dv.d !== null && dv.d.body !== null
+        width: parent.width
+        implicitHeight: payloadText.implicitHeight + Style.space(16)
+        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
+        radius: Style.cornerRadius
+        borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
+
+        // Selectable, so parts can be copied with the mouse and Ctrl+C.
+        TextEdit {
+          id: payloadText
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          readOnly: true
+          selectByMouse: true
+          textFormat: TextEdit.PlainText
+          text: dv.d && dv.d.body !== null ? dv.d.body : ""
+          color: root.foreground
+          selectionColor: root.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: TextEdit.WrapAnywhere
+        }
+      }
+    }
+  }
+
   component Caption: Text {
     textFormat: Text.PlainText
     width: parent ? parent.width : implicitWidth
@@ -346,18 +501,36 @@ Panel {
     font.pixelSize: Style.font.caption
   }
 
-  // A bordered tile: the count large, its label small underneath.
+  // A bordered tile: the count large, its label small underneath. Clicking it shows only
+  // that category in the Recent list (clicking again shows everything).
   component StatTile: BorderSurface {
     id: tile
     property string action: "allowed"
     property int value: 0
     readonly property bool lit: value > 0 && action !== "allowed"
+    readonly property bool selected: root.filter === action
 
     implicitHeight: tileColumn.implicitHeight + Style.space(14)
     height: implicitHeight
-    color: "transparent"
+    color: selected ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14) : "transparent"
     radius: Style.cornerRadius
-    borderSpec: Border.controlSpec("normal", lit ? root.toneFor(action) : root.foreground, Commons.Color.accent)
+    borderSpec: Border.controlSpec(tileMouse.containsMouse ? "hover" : "normal",
+                                   selected ? root.accent : (lit ? root.toneFor(action) : root.foreground),
+                                   Commons.Color.accent)
+
+    MouseArea {
+      id: tileMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.setFilter(tile.action)
+    }
+
+    PanelToolTip {
+      visible: tileMouse.containsMouse
+      text: strings.t("tile.hint")
+      fontFamily: root.fontFamily
+    }
 
     Column {
       id: tileColumn
@@ -397,6 +570,28 @@ Panel {
     readonly property color tone: root.toneFor(entry.action)
 
     implicitHeight: rowLayout.implicitHeight + Style.space(8)
+
+    Rectangle {
+      anchors.fill: parent
+      anchors.leftMargin: -Style.space(4)
+      anchors.rightMargin: -Style.space(4)
+      radius: Style.cornerRadius
+      color: rowMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : "transparent"
+    }
+
+    MouseArea {
+      id: rowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.showDetail(row.entry)
+    }
+
+    PanelToolTip {
+      visible: rowMouse.containsMouse
+      text: strings.t("detail.rowHint")
+      fontFamily: root.fontFamily
+    }
 
     RowLayout {
       id: rowLayout

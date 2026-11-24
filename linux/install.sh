@@ -82,6 +82,21 @@ else
   echo "NODE_EXTRA_CA_CERTS=$ETC/ca.pem" >> /etc/environment
 fi
 
+step "Request details for the bar widget (last 50 requests, redacted; readable by you only)"
+# The proxy keeps redacted copies of recent requests so the widget can show headers and
+# payload. The folder is readable only by the proxy and the user who ran this installer.
+owner=${SUDO_USER:-}
+[[ -z $owner && -n ${PKEXEC_UID:-} ]] && owner=$(id -nu "$PKEXEC_UID" 2>/dev/null || true)
+install -d -m 755 -o ai-dlp -g ai-dlp /var/log/ai-dlp
+install -d -m 750 -o ai-dlp -g ai-dlp /var/log/ai-dlp/requests
+if [[ -n $owner && $owner != root ]] && command -v setfacl >/dev/null; then
+  setfacl -m "u:$owner:rx" -d -m "u:$owner:r" /var/log/ai-dlp/requests
+  find /var/log/ai-dlp/requests -type f -exec setfacl -m "u:$owner:r" {} +
+  echo "Readable by: ai-dlp, $owner"
+else
+  echo "NOTE: could not tell which user to give access; the widget will not show request details." >&2
+fi
+
 step "Starting the proxy"
 systemctl daemon-reload
 systemctl enable ai-dlp-proxy

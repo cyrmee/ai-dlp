@@ -806,11 +806,95 @@ def _address_ip(conn) -> str | None:
     return address[0] if isinstance(address, tuple) and address else None
 
 
+# Stored copies of inspected requests, for the widget's detail view. Off unless
+# AI_DLP_KEEP_REQUESTS is set (the Linux service keeps the last 50). Only what actually
+# left the machine is stored (redacted), never a blocked body; login headers are masked.
+REQUESTS_DIR = Path(os.environ.get("AI_DLP_REQUESTS_DIR", LOG_DIR / "requests"))
+KEEP_REQUESTS = int(os.environ.get("AI_DLP_KEEP_REQUESTS", "0") or 0)
+REQUEST_MAX_BYTES = 1_000_000
+_SENSITIVE_HEADER = re.compile(r"auth|cookie|token|secret|key|session|password|credential|signature", re.I)
+_REQUEST_ID = re.compile(r"^\d{13}-[0-9a-f]{8}$")
+_last_request_ms = 0
+
+
+def safe_headers(fields, known: list[str]) -> list[list[str]]:
+    """Request headers fit to store: login headers masked, listed secrets redacted."""
+    out = []
+    for name, value in fields:
+        name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
+        value = value.decode("latin-1") if isinstance(value, bytes) else str(value)
+        if _SENSITIVE_HEADER.search(name):
+            value = "[hidden]"
+        else:
+            for secret in known:
+                if contains_secret(value, secret):
+                    value = value.replace(secret, "[REDACTED:known-secret]")
+        out.append([name[:100], value[:2000]])
+    return out
+
+
+def _compact(obj):
+    """Replace long base64 payloads (images, PDFs) with a short description."""
+    if isinstance(obj, dict):
+        return {k: _compact(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_compact(v) for v in obj]
+    if isinstance(obj, str) and len(obj) > 1000 and _is_base64(obj):
+        return f"[base64 data, {len(obj) * 3 // 4 // 1024} KB]"
+    return obj
+
+
+def displayable_body(body: bytes, content_type: str = "") -> tuple[str, bool]:
+    """(text, truncated): the body as readable text, JSON pretty-printed."""
+    try:
+        text = json.dumps(_compact(json.loads(body)), indent=2, ensure_ascii=False)
+    except ValueError:
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"[binary body, {len(body)} bytes, {content_type or 'unknown type'}]", False
+    data = text.encode("utf-8")
+    if len(data) > REQUEST_MAX_BYTES:
+        return data[:REQUEST_MAX_BYTES].decode("utf-8", "ignore"), True
+    return text, False
+
+
+def store_request(method: str, host: str, path: str, headers: list[list[str]],
+                  body: str | None, truncated: bool = False) -> str | None:
+    """Save one request for the detail view; returns its id (None when off or on error)."""
+    global _last_request_ms
+    if KEEP_REQUESTS <= 0:
+        return None
+    # Ids start with a strictly increasing millisecond time, so sorting them by name
+    # orders them oldest first even when several arrive in the same millisecond.
+    _last_request_ms = max(int(time.time() * 1000), _last_request_ms + 1)
+    rid = f"{_last_request_ms}-{os.urandom(4).hex()}"
+    record = {"id": rid, "method": method[:10], "host": host[:253],
+              "path": path.split("?")[0][:2000],  # query dropped: some APIs put keys there
+              "headers": headers, "body": body, "truncated": truncated}
+    try:
+        REQUESTS_DIR.mkdir(mode=0o750, exist_ok=True)
+        tmp = REQUESTS_DIR / f".{rid}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o640)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+        os.replace(tmp, REQUESTS_DIR / f"{rid}.json")
+        stored = sorted(REQUESTS_DIR.glob("*.json"))  # ids start with the time: oldest first
+        for old in stored[:-KEEP_REQUESTS]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("ai-dlp: could not store request details: %s", e)
+        return None
+    return rid
+
+
 def record_event(action: str, host: str, path: str, method: str = "", size: int = 0,
                  counts: Counter | None = None, reason: str = "", test: bool = False,
-                 attachments: list[dict] | None = None) -> None:
+                 attachments: list[dict] | None = None, request_id: str | None = None) -> None:
     event = {"time": int(time.time() * 1000), "action": action, "host": host[:253],
              "method": method[:10], "path": path.split("?")[0][:200], "bytes": size}
+    if request_id:
+        event["id"] = request_id
     if counts:
         event["rules"] = dict(counts)
     if reason:
@@ -893,8 +977,14 @@ class AiDLP:
             "type": "invalid_request_error", "message": f"ai-dlp blocked this request: {reason}"}})
         flow.response = http.Response.make(400, body, {"content-type": "application/json"})
         req = flow.request
+        rid = None
+        try:  # headers only: a blocked body holds the secret that could not be removed
+            rid = store_request(req.method, req.pretty_host, req.path, safe_headers(req.headers.fields, []),
+                                None)
+        except Exception as e:
+            log.warning("ai-dlp: could not store request details: %s", e)
         record_event("blocked", req.pretty_host, req.path, req.method, reason=reason,
-                     test=req.headers.get(ECHO_HEADER) == "1")
+                     test=req.headers.get(ECHO_HEADER) == "1", request_id=rid)
 
     def _inspected(self, flow) -> bool:
         """Scan when the connection was opened to a listed name (TLS SNI) OR the request
@@ -935,8 +1025,16 @@ class AiDLP:
         if attachments:
             kinds = Counter(a["kind"] for a in attachments)
             log.warning("ai-dlp: flagged %s sent to %s", _summary(kinds), where)
+        rid = None
+        if KEEP_REQUESTS > 0:
+            try:  # what actually left the machine: the redacted body
+                text, truncated = displayable_body(cleaned, req.headers.get("content-type", ""))
+                rid = store_request(req.method, req.pretty_host, req.path,
+                                    safe_headers(req.headers.fields, self.secrets.current()), text, truncated)
+            except Exception as e:
+                log.warning("ai-dlp: could not store request details: %s", e)
         record_event("redacted" if counts else "allowed", req.pretty_host, req.path, req.method,
-                     len(content), counts, test=echo, attachments=attachments)
+                     len(content), counts, test=echo, attachments=attachments, request_id=rid)
         if echo:
             flow.response = http.Response.make(200, cleaned, {"content-type": "application/octet-stream"})
 

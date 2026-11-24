@@ -43,6 +43,40 @@ Item {
   // "redacted", "blocked" or "attachment" for a few seconds after one happens, for the bar icon.
   property string flash: ""
 
+  // The request opened in the detail view: { method, host, path, headers: [[name, value]],
+  // body, truncated, file, error }, or null. Loaded on demand from the stored copy.
+  property var detail: null
+  readonly property bool detailLoading: detailProcess.running
+
+  function loadDetail(id) {
+    if (!/^\d{13}-[0-9a-f]{8}$/.test(String(id || ""))) {
+      detail = { error: t("detail.notStored"), headers: [], body: null }
+      return
+    }
+    detail = null
+    detailProcess.command = [helperPath, "detail", id]
+    detailProcess.running = true
+  }
+
+  function applyDetail(raw) {
+    var d
+    try { d = JSON.parse(String(raw || "")) } catch (e) { d = { error: t("detail.readFailed") } }
+    var headers = Array.isArray(d.headers) ? d.headers.slice(0, 200).map(function(h) {
+      return [bounded(h[0], 100), bounded(h[1], 2000)]
+    }) : []
+    detail = {
+      method: bounded(d.method, 10), host: bounded(d.host, 253), path: bounded(d.path, 2000),
+      headers: headers, body: d.body === null || d.body === undefined ? null : bounded(d.body, 200000),
+      truncated: d.truncated === true, file: bounded(d.file, 300), error: bounded(d.error, 200)
+    }
+  }
+
+  function openFile(path) {
+    var p = String(path || "")
+    if (/^\/var\/log\/ai-dlp\/requests\/\d{13}-[0-9a-f]{8}\.json$/.test(p))
+      Quickshell.execDetached(["xdg-open", p])
+  }
+
   property double _lastSeen: 0
   property double _lastRedactNotify: 0
 
@@ -82,6 +116,7 @@ Item {
       rules: rules,
       reason: bounded(e.reason, 200),
       test: e.test === true,
+      id: /^\d{13}-[0-9a-f]{8}$/.test(String(e.id || "")) ? String(e.id) : "",
       attachments: attachments
     }
   }
@@ -195,6 +230,13 @@ Item {
     command: [root.helperPath, "status"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: function(exitCode) { if (exitCode === 0) root.apply(statusOut.text) }
+  }
+
+  Process {
+    id: detailProcess
+    command: []
+    stdout: StdioCollector { id: detailOut; waitForEnd: true }
+    onExited: function(exitCode) { root.applyDetail(detailOut.text) }
   }
 
   Process {

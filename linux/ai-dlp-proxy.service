@@ -11,6 +11,8 @@ Environment=HOME=/var/lib/ai-dlp
 Environment=PYTHONUNBUFFERED=1
 # Keep OCR from taking every CPU core.
 Environment=OMP_THREAD_LIMIT=2
+# Keep the last 50 inspected requests (redacted) for the bar widget's detail view; 0 = off.
+Environment=AI_DLP_KEEP_REQUESTS=50
 StateDirectory=ai-dlp
 StateDirectoryMode=0700
 LogsDirectory=ai-dlp
