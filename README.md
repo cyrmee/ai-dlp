@@ -28,12 +28,16 @@ The core (`core/`) is the same everywhere; CI runs its tests on Linux, macOS and
    Nothing depends on a provider's IP addresses, so a provider moving to new addresses changes nothing. Lookalikes such as `evilanthropic.com` do not match.
 3. **Scanning.** Each inspected request body is checked two ways:
    - against your own **exact secret values**;
-   - with **[gitleaks](https://github.com/gitleaks/gitleaks)**: its full default rule set (about 200 credential formats, with keyword and entropy checks) plus extra rules for passwords in URLs and `password=` lines.
+   - with **[gitleaks](https://github.com/gitleaks/gitleaks)**: its full default rule set (about 200 credential formats, with keyword and entropy checks) plus extra rules for passwords in URLs and `password=` lines (values of 4+ characters; placeholders such as `null` or `<value>` are ignored).
+
+   Listed values shorter than 8 characters only match as whole words, so a short password does not redact every word containing it.
+
+   **Images and PDFs** are read too. On Linux, OCR is done with [tesseract](https://github.com/tesseract-ocr/tesseract), PDFs' text layers with poppler, and scanned PDF pages with OCR. Elsewhere, only the readable text inside the file is checked. A secret found inside an image or PDF cannot be blacked out in the file, so that request is blocked. Results are cached, so a resent conversation is not OCR'd again.
 
    JSON bodies are parsed and each string is scanned separately. Results are cached, so conversation history an agent resends every turn is not scanned again.
 4. **Redaction.** Each match is replaced with `[REDACTED:<rule-id>]` and the request continues.
 5. **Fail closed.** If a body cannot be scanned reliably (scanner error, undecodable encoding, a finding that cannot be located), the request is blocked with a clear error instead of being sent.
-6. **Attachments.** Each image or PDF is recorded the first time it is sent, with its type, size and name.
+6. **Attachments.** Each image or PDF is recorded the first time it is sent, with its type, size and name. Other binary uploads that cannot be read (zip, docx and the like) are blocked; audio and video are allowed and flagged.
 7. **Event log.** `events.jsonl` gets one line per inspected request: outcome, host, path, rule names and attachments. It never contains secret values.
 
 ### The certificate authority
@@ -131,7 +135,7 @@ After editing the list, run the installer again (it issues a matching CA), then 
 ## Limits
 
 - **Pattern-based detection.** Unusual passwords, secrets that are encoded, split or disguised, and values not on your list can get through. Treat ai-dlp as a safety net behind keeping secrets out of an agent's reach (sandboxes, read-deny rules), not as a replacement.
-- **Images and PDFs** are flagged, not scanned.
+- **Images and PDFs:** OCR (Linux) reads printed and screenshot text well, but handwriting, tiny or distorted text, and text in other scripts can be missed. Scanned PDFs are OCR'd up to 20 text-less pages; longer ones are blocked.
 - **The domain name must be visible, or the address known.**
   - Connections without a name, or with Encrypted Client Hello, are forced through inspection when they go to an address a listed service uses; the proxy learns these from DNS and from its own connections.
   - A client that deliberately sends a different, unlisted name to a shared CDN address (domain fronting) is not caught. That is deliberate evasion, which ai-dlp does not try to stop.

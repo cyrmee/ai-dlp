@@ -18,10 +18,14 @@ secretGroup = 1
 keywords = ["://"]
 
 # password = "<value>", DB_PASSWORD=<value>, secret: <value>, client_secret: <value>
-# Quoted values, or unquoted values that end the line. ${VAR} references and code
-# such as `password = request.getPassword();` are not matched.
+# Values of 4+ characters: quoted, or unquoted at the end of a line. ${VAR} references,
+# code such as `password = request.getPassword();` and placeholders such as null,
+# none, true, changeme, **** or <value> are not matched.
 [[rules]]
 id = "password-assignment"
 description = "Password or secret assigned in config, env or code"
-regex = '''(?i)(?:password|passwd|pwd|secret)["']?[ \t]{0,3}[:=][ \t]{0,3}(?:"([^"\s$]{8,200})"|'([^'\s$]{8,200})'|([^\s"'$\{\(\);,]{8,200})(?:[\r\n]|$))'''
+regex = '''(?i)(?:password|passwd|pwd|secret)["']?[ \t]{0,3}[:=][ \t]{0,3}(?:"([^"\s$]{4,200})"|'([^'\s$]{4,200})'|([^\s"'$\{\(\);,]{4,200})(?:[\r\n]|$))'''
 keywords = ["password", "passwd", "pwd", "secret"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|your[_-]?\w*|x+|\*+|\.+|<[^>]*>|\[REDACTED:[^\]]*\])$''']

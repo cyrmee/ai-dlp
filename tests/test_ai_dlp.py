@@ -91,6 +91,26 @@ class RedactTests(unittest.TestCase):
         text = json.loads(out)["messages"][0]["content"][0]["text"]
         self.assertEqual(text, "DATABASE_URL=postgres://app:[REDACTED:url-password]@db.internal:5432/app")
 
+    def test_short_passwords_are_caught(self):
+        for template in ("password=ab12", 'DB_PASSWORD="xy9!"', "secret: 'qz7w'", "pwd=hunt3r"):
+            v = template.split("=")[-1].split(":")[-1].strip(" '\"")
+            out, counts = self.redact(body_of(template))
+            self.assertNotIn(v.encode(), out, template)
+            self.assertEqual(counts["password-assignment"], 1, template)
+
+    def test_password_placeholders_are_left_alone(self):
+        for text in ("password = null", "password: none", "pwd=true", "password=****", 'password="<value>"',
+                     "password=[REDACTED:known-secret]", "password=abc"):
+            body = body_of(text)
+            out, counts = self.redact(body)
+            self.assertEqual(out, body, text)
+
+    def test_short_listed_secret_matches_whole_words_only(self):
+        SECRETS.write_text("k9x2\n")
+        out, counts = self.redact(body_of("pin k9x2 here; also k9x2z and ak9x2 stay"))
+        text = json.loads(out)["messages"][0]["content"][0]["text"]
+        self.assertEqual(text, "pin [REDACTED:known-secret] here; also k9x2z and ak9x2 stay")
+
     def test_password_assignment_forms(self):
         for template in ("DB_PASSWORD={v}", 'password = "{v}"', "client_secret: {v}\nother: 1",
                          "spring.datasource.password={v}"):
@@ -411,6 +431,7 @@ class AttachmentTests(unittest.TestCase):
     def test_event_records_attachment(self):
         EVENTS.unlink(missing_ok=True)
         addon = dlp.AiDLP()
+        addon.ocr.tesseract = None  # this test is about the event; the bytes are not a readable image
         dlp.http = type("http", (), {"Response": AddonHookTests.FakeResponse})
         import base64 as b64
         png = b64.b64encode(b"\x89PNG\r\n\x1a\n" + os.urandom(90)).decode()
@@ -624,7 +645,7 @@ class AddSecretsToolTests(unittest.TestCase):
         dest.parent.mkdir(exist_ok=True)
         dest.write_text("existingValue1\n")
         env = TMP / "add.env"
-        env.write_text("A=newSecretValue2\nB=short\n")
+        env.write_text("A=newSecretValue2\nB=abc\n")
         if os.name == "posix":
             victim = TMP / "victim2.txt"
             victim.write_text("keep")
@@ -641,6 +662,73 @@ class AddSecretsToolTests(unittest.TestCase):
         if os.name == "posix":
             self.assertEqual(victim.read_text(), "keep")
             self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+
+
+def _pdf_with_lines(*lines):
+    content = "BT /F1 28 Tf 72 700 Td " + " ".join(f"({l}) Tj 0 -40 Td" for l in lines) + " ET"
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            f"<< /Length {len(content)} >>\nstream\n{content}\nendstream",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offs = b"%PDF-1.4\n", []
+    for i, o in enumerate(objs, 1):
+        offs.append(len(out))
+        out += f"{i} 0 obj\n{o}\nendobj\n".encode()
+    x = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode() + b"".join(f"{o:010d} 00000 n \n".encode() for o in offs)
+    return out + f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n".encode()
+
+
+def _png_of(pdf: bytes) -> bytes:
+    import shutil, subprocess
+    d = Path(tempfile.mkdtemp(dir=TMP))
+    (d / "p.pdf").write_bytes(pdf)
+    subprocess.run([shutil.which("pdftoppm"), "-r", "200", "-png", "-singlefile", str(d / "p.pdf"), str(d / "p")], check=True)
+    return (d / "p.png").read_bytes()
+
+
+@unittest.skipUnless(all(__import__("shutil").which(t) for t in ("tesseract", "pdftotext", "pdftoppm")),
+                     "OCR tools (tesseract, poppler) not installed")
+class OCRTests(unittest.TestCase):
+    def setUp(self):
+        SECRETS.write_text("")
+        self.gl, self.ocr = dlp.Gitleaks(), dlp.OCR()
+
+    def block(self, kind, media, raw):
+        import base64 as b64
+        return json.dumps({"messages": [{"role": "user", "content": [{"type": kind, "source": {
+            "type": "base64", "media_type": media, "data": b64.b64encode(raw).decode()}}]}]}).encode()
+
+    def test_secret_in_an_image_is_caught_by_ocr(self):
+        png = _png_of(_pdf_with_lines("password=Kangaroo42", "nothing else here"))
+        with self.assertRaises(dlp.ScanError) as e:
+            run(dlp.redact(self.block("image", "image/png", png), [], self.gl, "application/json", self.ocr))
+        self.assertIn("image or PDF", str(e.exception))
+
+    def test_secret_in_a_pdf_text_layer_is_caught(self):
+        pdf = _pdf_with_lines("config", "password=Kangaroo42")
+        with self.assertRaises(dlp.ScanError):
+            run(dlp.redact(self.block("document", "application/pdf", pdf), [], self.gl, "application/json", self.ocr))
+
+    def test_listed_secret_in_an_image_is_caught(self):
+        png = _png_of(_pdf_with_lines("my pin is Zebra7731"))
+        with self.assertRaises(dlp.ScanError):
+            run(dlp.redact(self.block("image", "image/png", png), ["Zebra7731"], self.gl, "application/json", self.ocr))
+
+    def test_clean_image_passes_and_is_ocrd_once(self):
+        png = _png_of(_pdf_with_lines("quarterly report", "nothing secret here"))
+        body = self.block("image", "image/png", png)
+        out, counts = run(dlp.redact(body, [], self.gl, "application/json", self.ocr))
+        self.assertEqual(out, body)
+        calls = []
+        original = self.ocr._image
+
+        async def counting(raw):
+            calls.append(1)
+            return await original(raw)
+        self.ocr._image = counting
+        run(dlp.redact(body, [], self.gl, "application/json", self.ocr))
+        self.assertEqual(calls, [])  # second time served from the OCR cache
 
 
 class HiddenNameTests(unittest.TestCase):

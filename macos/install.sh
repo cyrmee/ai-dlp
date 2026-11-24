@@ -143,6 +143,7 @@ cat > "$PLIST" <<EOF
     <string>$PREFIX/venv/bin/mitmdump</string>
     <string>--mode</string><string>local</string>
     <string>--set</string><string>confdir=$STATE</string>
+    <string>--set</string><string>upstream_cert=false</string>
     <string>--set</string><string>flow_detail=0</string>
     <string>--set</string><string>termlog_verbosity=info</string>
     <string>-s</string><string>$CONF/ai_dlp.py</string>

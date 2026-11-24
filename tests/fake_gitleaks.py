@@ -40,6 +40,9 @@ for rule in rules:
             secret = m.group(rule["secretGroup"])
         else:
             secret = next((g for g in groups if g), m.group(0))
+        allow = [re.compile(a2) for al in rule.get("allowlists", []) for a2 in al.get("regexes", [])]
+        if any(a.search(secret) for a in allow):  # like gitleaks' per-rule allowlists (regexTarget = secret)
+            continue
         findings.append({"RuleID": rule["id"], "Secret": secret, "Match": m.group(0)})
 
 with open(report, "w", encoding="utf-8") as f:

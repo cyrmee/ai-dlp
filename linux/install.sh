@@ -19,8 +19,8 @@ if [[ -f /etc/systemd/system/claude-dlp-proxy.service ]]; then
   exit 1
 fi
 
-step "Installing mitmproxy and gitleaks from the Arch repos"
-pacman -S --needed --noconfirm mitmproxy gitleaks python-cryptography
+step "Installing mitmproxy, gitleaks and OCR tools (tesseract, poppler) from the Arch repos"
+pacman -S --needed --noconfirm mitmproxy gitleaks python-cryptography tesseract tesseract-data-eng poppler
 
 step "Creating system user ai-dlp"
 install -Dm644 "$SRC/ai-dlp.sysusers" /etc/sysusers.d/ai-dlp.conf

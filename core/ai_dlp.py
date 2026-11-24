@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import hashlib
 import json
 import logging
@@ -77,7 +78,11 @@ GITLEAKS_CONFIG = Path(os.environ.get("AI_DLP_GITLEAKS_CONFIG", CONFIG_DIR / "gi
 # The gitleaks command (a list, so tests can run a script through the interpreter).
 GITLEAKS_CMD = [os.environ.get("AI_DLP_GITLEAKS") or shutil.which("gitleaks") or "gitleaks"]
 GITLEAKS_TIMEOUT = 30
-MIN_LEN = 8
+# Shortest secret value that is matched exactly. Values shorter than SHORT_LEN only
+# match as whole words, so a 4-character password does not redact every word that
+# happens to contain it.
+MIN_LEN = 4
+SHORT_LEN = 8
 CACHE_SIZE = 50_000
 # Domains (and their subdomains) whose traffic is decrypted and inspected, one per
 # line. Everything else passes through untouched. Reloaded when the file changes.
@@ -310,6 +315,89 @@ def _readable_runs(raw: bytes) -> str:
     return "\n".join(m.group().decode("ascii") for m in _PRINTABLE_RUN.finditer(raw))
 
 
+# Images and PDFs found while parsing a body, for OCR (set by redact()).
+_MEDIA: contextvars.ContextVar[list[bytes] | None] = contextvars.ContextVar("ai_dlp_media", default=None)
+
+OCR_MAX_BYTES = 25_000_000
+OCR_MAX_PAGES = 20      # scanned (text-less) PDF pages OCR'd per document
+OCR_TIMEOUT = 60        # seconds per tool run
+OCR_CACHE = 2_000
+
+
+class OCR:
+    """Text inside images and PDFs: pdftotext for a PDF's text layer, tesseract for images
+    and for PDF pages that have no text layer (scans). Results are cached per file, so
+    the history an agent resends every turn is not OCR'd again. If the tools are not
+    installed, OCR is skipped and only the readable-text scan applies.
+    """
+
+    def __init__(self) -> None:
+        self.tesseract = shutil.which("tesseract")
+        self.pdftotext = shutil.which("pdftotext")
+        self.pdftoppm = shutil.which("pdftoppm")
+        self.cache: OrderedDict[bytes, str] = OrderedDict()
+        if not self.tesseract:
+            log.info("ai-dlp: tesseract not found; images and PDFs get the readable-text scan only")
+
+    @property
+    def available(self) -> bool:
+        return bool(self.tesseract)
+
+    async def _run(self, cmd: list[str], data: bytes | None) -> bytes:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(data), OCR_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise ScanError(f"{Path(cmd[0]).name} timed out reading an image or PDF")
+        if proc.returncode != 0:
+            raise ScanError(f"{Path(cmd[0]).name} could not read an image or PDF: "
+                            f"{err.decode(errors='replace').strip()[:160]}")
+        return out
+
+    async def _image(self, raw: bytes) -> str:
+        return (await self._run([self.tesseract, "stdin", "stdout", "-l", "eng"], raw)).decode("utf-8", "replace")
+
+    async def _pdf(self, raw: bytes) -> str:
+        if not (self.pdftotext and self.pdftoppm):
+            raise ScanError("PDF text cannot be checked: poppler (pdftotext, pdftoppm) is not installed")
+        text = (await self._run([self.pdftotext, "-layout", "-", "-"], raw)).decode("utf-8", "replace")
+        pages = text.split("\f")
+        if pages and not pages[-1].strip():
+            pages = pages[:-1]
+        scanned = [n for n, page in enumerate(pages, 1) if len(page.strip()) < 20]
+        if len(scanned) > OCR_MAX_PAGES:
+            raise ScanError(f"PDF has {len(scanned)} pages without a text layer; OCR is limited to {OCR_MAX_PAGES}")
+        parts = [text]
+        if scanned:
+            with tempfile.TemporaryDirectory(prefix="ai-dlp-ocr-") as tmp:
+                src = Path(tmp) / "in.pdf"
+                src.write_bytes(raw)
+                for n in scanned:
+                    out = Path(tmp) / f"p{n}"
+                    await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", "200", "-png",
+                                     "-singlefile", str(src), str(out)], None)
+                    parts.append(await self._image(out.with_suffix(".png").read_bytes()))
+        return "\n".join(parts)
+
+    async def text_of(self, raw: bytes) -> str | None:
+        if not self.available:
+            return None
+        key = hashlib.sha256(raw).digest()
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        if len(raw) > OCR_MAX_BYTES:
+            raise ScanError(f"image or PDF of {len(raw) // 1_000_000} MB is too large to check for secrets")
+        text = await (self._pdf(raw) if raw.startswith(b"%PDF-") else self._image(raw))
+        self.cache[key] = text
+        while len(self.cache) > OCR_CACHE:
+            self.cache.popitem(last=False)
+        return text
+
+
 def _bytes_views(raw: bytes, media: str) -> list[str]:
     """Scannable text for decoded content, or ScanError if it cannot be scanned.
 
@@ -319,6 +407,9 @@ def _bytes_views(raw: bytes, media: str) -> list[str]:
     """
     media = (media or "").lower().split(";")[0].strip()
     if _is_image_or_pdf(raw[:16]):
+        collected = _MEDIA.get()
+        if collected is not None:  # redact() OCRs these after parsing
+            collected.append(raw)
         return [_readable_runs(raw)]
     try:
         return [raw.decode("utf-8")]
@@ -400,38 +491,72 @@ def texts_of(body: bytes, content_type: str = "") -> list[str]:
     return out
 
 
+def _word_rx(value: str | bytes):
+    """Match value only where it is not part of a longer word (for short secrets)."""
+    if isinstance(value, bytes):
+        return re.compile(rb"(?<![A-Za-z0-9])" + re.escape(value) + rb"(?![A-Za-z0-9])")
+    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(value) + r"(?![A-Za-z0-9])")
+
+
+def contains_secret(text: str, secret: str) -> bool:
+    if len(secret) >= SHORT_LEN:
+        return secret in text
+    return _word_rx(secret).search(text) is not None
+
+
 def replace_all(body: bytes, hits: list[tuple[str, str]], counts: Counter) -> bytes:
-    """Replace every encoding of each secret in the raw body."""
+    """Replace every encoding of each secret in the raw body (short ones as whole words)."""
     for rule, secret in hits:
         found = 0
         for form in encodings(secret):
-            n = body.count(form)
-            if n:
-                found += n
-                body = body.replace(form, placeholder(rule))
+            if len(secret) >= SHORT_LEN:
+                n = body.count(form)
+                if n:
+                    body = body.replace(form, placeholder(rule))
+            else:
+                body, n = _word_rx(form).subn(placeholder(rule), body)
+            found += n
         if found:
             counts[rule] += found
     return body
 
 
 async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
-                 content_type: str = "") -> tuple[bytes, Counter]:
+                 content_type: str = "", ocr: OCR | None = None) -> tuple[bytes, Counter]:
     counts: Counter = Counter()
     body = replace_all(body, [("known-secret", s) for s in known if any(f in body for f in encodings(s))], counts)
-    texts = texts_of(body, content_type)
-    # A known secret can also be spelled in ways the raw replacement cannot see (for
-    # example JSON \u escapes) yet decode to the same text. If one is still present
-    # after decoding, the request must not leave.
+    media: list[bytes] = []
+    token = _MEDIA.set(media)
+    try:
+        texts = texts_of(body, content_type)
+    finally:
+        _MEDIA.reset(token)
+    # Text read from images and PDFs. A secret found there cannot be blacked out inside
+    # the file, so it blocks the request (below).
+    ocr_texts = []
+    if ocr is not None:
+        for raw in media:
+            text = await ocr.text_of(raw)
+            if text:
+                ocr_texts.append(text)
     for secret in known:
-        if any(secret in t for t in texts):
+        if any(contains_secret(t, secret) for t in ocr_texts):
+            raise ScanError("a listed secret appears in the text of an image or PDF")
+        # A known secret can also be spelled in ways the raw replacement cannot see (for
+        # example JSON \u escapes) yet decode to the same text.
+        if any(contains_secret(t, secret) for t in texts):
             raise ScanError("a listed secret is present in an encoding that could not be rewritten")
-    hits = await gitleaks.scan(texts) if texts else []
+    scanned = texts + ocr_texts
+    hits = await gitleaks.scan(scanned) if scanned else []
+    for rule, secret in hits:
+        if any(contains_secret(t, secret) for t in ocr_texts):
+            raise ScanError(f"a secret ({rule}) appears in the text of an image or PDF")
     body = replace_all(body, hits, counts)
     if hits:
         # A finding that is still present (in an encoding we did not rewrite) must not leave.
         remaining = texts_of(body, content_type)
         for rule, secret in hits:
-            if any(secret in t for t in remaining):
+            if any(contains_secret(t, secret) for t in remaining):
                 raise ScanError(f"finding '{rule}' could not be rewritten in the raw body")
     return body, counts
 
@@ -571,6 +696,7 @@ class AiDLP:
         self.secrets = SecretList(SECRETS_FILE)
         self.gitleaks = Gitleaks()
         self.attachments = AttachmentTracker()
+        self.ocr = OCR()
         self.domains = DomainList(DOMAINS_FILE)
         # Addresses known to serve a listed domain: from the proxy's own DNS lookups and
         # from connections it intercepted. Used to catch connections that hide the name.
@@ -655,7 +781,7 @@ class AiDLP:
             return
         try:
             cleaned, counts = await redact(content, self.secrets.current(), self.gitleaks,
-                                           req.headers.get("content-type", ""))
+                                           req.headers.get("content-type", ""), self.ocr)
         except Exception as e:  # fail closed: never forward an unscanned body
             log.warning("ai-dlp: BLOCKED %s: %s", where, e)
             self._block(flow, str(e) if isinstance(e, ScanError) else "internal scanner error")
@@ -691,7 +817,7 @@ class AiDLP:
         try:
             # Binary frames (e.g. voice audio) are treated like audio: flagged, not blocked.
             kind = "text/plain" if getattr(msg, "is_text", True) else "audio/x-websocket-binary"
-            cleaned, counts = await redact(msg.content, self.secrets.current(), self.gitleaks, kind)
+            cleaned, counts = await redact(msg.content, self.secrets.current(), self.gitleaks, kind, self.ocr)
         except Exception as e:
             log.warning("ai-dlp: dropped websocket message to %s: %s", flow.request.pretty_host, e)
             msg.drop()
