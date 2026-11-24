@@ -120,6 +120,21 @@ class RedactTests(unittest.TestCase):
         self.assertIn("the [REDACTED:known-secret] value", text)
         self.assertIn("app:[REDACTED:url-password]@db", text)
 
+    def test_fake_markers_and_your_prefix_are_not_allowlisted(self):
+        for text, secret in (("postgres://app:[REDACTED:hunter2]@db:5432/x", "hunter2"),
+                             ("password=yourRealPassword123", "yourRealPassword123"),
+                             ("DB_PASSWORD=[REDACTED:Kangaroo42]", "Kangaroo42")):
+            out, counts = self.redact(body_of(text))
+            self.assertNotIn(secret.encode(), out, text)
+
+    def test_echoed_real_markers_are_left_alone(self):
+        for text in ("postgres://app:[REDACTED:url-password]@db:5432/x", "password=[REDACTED:known-secret]",
+                     "password=your_password", "postgres://app:your-secret@db/x"):
+            body = body_of(text)
+            out, counts = self.redact(body)
+            self.assertEqual(out, body, text)
+            self.assertFalse(counts, text)
+
     def test_secret_hidden_in_a_fake_marker_is_still_caught(self):
         SECRETS.write_text("Zebra7731\n")
         hidden = "".join(f"\\u{ord(c):04x}" for c in "Zebra7731")  # decodes to the secret

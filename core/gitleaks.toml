@@ -19,7 +19,7 @@ secretGroup = 1
 keywords = ["://"]
 [[rules.allowlists]]
 regexTarget = "secret"
-regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|your[_-]?\w*|my[_-]?password|x+|\*+|\.+|\[REDACTED:[^\]]*\])$''']
+regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+)$''']
 
 # password = "<value>", DB_PASSWORD=<value>, secret: <value>, client_secret: <value>
 # Values of 4+ characters: quoted, or unquoted at the end of a line. ${VAR} references,
@@ -32,4 +32,4 @@ regex = '''(?i)(?:password|passwd|pwd|secret)["']?[ \t]{0,3}[:=][ \t]{0,3}(?:"([
 keywords = ["password", "passwd", "pwd", "secret"]
 [[rules.allowlists]]
 regexTarget = "secret"
-regexes = ['''(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|your[_-]?\w*|x+|\*+|\.+|<[^>]*>|\[REDACTED:[^\]]*\])$''']
+regexes = ['''(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|<[^>]*>)$''']

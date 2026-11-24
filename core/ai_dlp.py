@@ -626,6 +626,18 @@ def _word_rx(value: str | bytes):
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(value) + r"(?![A-Za-z0-9])")
 
 
+# Labels ai-dlp writes into markers: "known-secret" plus every rule id gitleaks has
+# reported (ids come from the rules, never from request content).
+MARKER_LABELS: set[str] = {"known-secret", "url-password", "password-assignment"}
+
+
+def is_own_marker(value: str) -> bool:
+    """True if value is exactly a marker ai-dlp writes, e.g. [REDACTED:aws-access-token]
+    echoed back in a conversation. Text merely shaped like one ([REDACTED:hunter2]) is not."""
+    return (value.startswith("[REDACTED:") and value.endswith("]")
+            and value[len("[REDACTED:"):-1] in MARKER_LABELS)
+
+
 def _without_markers(text: str, labels) -> str:
     """Text with the markers ai-dlp itself inserted ([REDACTED:<label>] for these exact
     labels) blanked out, so a secret that happens to be part of a marker (a URL password
@@ -693,18 +705,19 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
             raise ScanError("a listed secret appears in the text of an image or PDF")
         # A known secret can also be spelled in ways the raw replacement cannot see (for
         # example JSON \u escapes) yet decode to the same text.
-        if any(contains_secret(_without_markers(t, {"known-secret"}), secret) for t in texts):
+        if any(contains_secret(_without_markers(t, MARKER_LABELS), secret) for t in texts):
             raise ScanError("a listed secret is present in an encoding that could not be rewritten")
     scanned = texts + ocr_texts
     hits = await gitleaks.scan(scanned) if scanned else []
+    MARKER_LABELS.update(rule for rule, _ in hits)
+    hits = [(rule, secret) for rule, secret in hits if not is_own_marker(secret)]
     for rule, secret in hits:
         if any(contains_secret(t, secret) for t in ocr_texts):
             raise ScanError(f"a secret ({rule}) appears in the text of an image or PDF")
     body = replace_all(body, hits, counts)
     if hits:
         # A finding that is still present (in an encoding we did not rewrite) must not leave.
-        labels = {"known-secret"} | {rule for rule, _ in hits}
-        remaining = [_without_markers(t, labels) for t in texts_of(body, content_type)]
+        remaining = [_without_markers(t, MARKER_LABELS) for t in texts_of(body, content_type)]
         for rule, secret in hits:
             if any(contains_secret(t, secret) for t in remaining):
                 raise ScanError(f"finding '{rule}' could not be rewritten in the raw body")
