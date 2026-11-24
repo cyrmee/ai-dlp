@@ -626,6 +626,16 @@ def _word_rx(value: str | bytes):
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(value) + r"(?![A-Za-z0-9])")
 
 
+_MARKER = re.compile(r"\[REDACTED:[A-Za-z0-9_.\-]{1,64}\]")
+
+
+def _without_markers(text: str) -> str:
+    """Text with ai-dlp's own [REDACTED:rule] markers blanked out, so a secret that happens
+    to be part of a marker (for example a URL password "password" and the marker
+    [REDACTED:url-password]) is not mistaken for one that is still there."""
+    return _MARKER.sub(" ", text)
+
+
 def contains_secret(text: str, secret: str) -> bool:
     if len(secret) >= SHORT_LEN:
         return secret in text
@@ -681,7 +691,7 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
             raise ScanError("a listed secret appears in the text of an image or PDF")
         # A known secret can also be spelled in ways the raw replacement cannot see (for
         # example JSON \u escapes) yet decode to the same text.
-        if any(contains_secret(t, secret) for t in texts):
+        if any(contains_secret(_without_markers(t), secret) for t in texts):
             raise ScanError("a listed secret is present in an encoding that could not be rewritten")
     scanned = texts + ocr_texts
     hits = await gitleaks.scan(scanned) if scanned else []
@@ -691,7 +701,7 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
     body = replace_all(body, hits, counts)
     if hits:
         # A finding that is still present (in an encoding we did not rewrite) must not leave.
-        remaining = texts_of(body, content_type)
+        remaining = [_without_markers(t) for t in texts_of(body, content_type)]
         for rule, secret in hits:
             if any(contains_secret(t, secret) for t in remaining):
                 raise ScanError(f"finding '{rule}' could not be rewritten in the raw body")

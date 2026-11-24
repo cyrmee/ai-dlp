@@ -9,13 +9,17 @@ title = "ai-dlp"
 useDefault = true
 
 # scheme://user:PASSWORD@host  (e.g. postgres://app:<password>@db:5432/app)
-# Placeholders such as ${DB_PASS} or <password> are not matched.
+# Placeholders such as ${DB_PASS}, <password>, password, secret, changeme or **** (as in
+# READMEs, .env.example and docker-compose files) are not matched.
 [[rules]]
 id = "url-password"
 description = "Password embedded in a connection URL"
 regex = '''(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@"'\\]{1,64}:([^\s@/"'\\$<>{}]{3,128})@'''
 secretGroup = 1
 keywords = ["://"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|your[_-]?\w*|my[_-]?password|x+|\*+|\.+|\[REDACTED:[^\]]*\])$''']
 
 # password = "<value>", DB_PASSWORD=<value>, secret: <value>, client_secret: <value>
 # Values of 4+ characters: quoted, or unquoted at the end of a line. ${VAR} references,

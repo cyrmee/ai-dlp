@@ -105,6 +105,21 @@ class RedactTests(unittest.TestCase):
             out, counts = self.redact(body)
             self.assertEqual(out, body, text)
 
+    def test_placeholder_url_passwords_are_left_alone(self):
+        for url in ("postgres://user:password@localhost:5432/db", "redis://:secret@cache:6379",
+                    "mysql://root:changeme@db/app", "amqp://guest:****@mq:5672"):
+            body = body_of("DATABASE_URL=" + url)
+            out, counts = self.redact(body)
+            self.assertEqual(out, body, url)
+
+    def test_secret_that_is_part_of_a_marker_does_not_block(self):
+        # "known" is inside the marker [REDACTED:known-secret]; that must not look like a leak.
+        SECRETS.write_text("known\n")
+        out, counts = self.redact(body_of("the known value and a real one: postgres://app:Kangaroo42@db:5432/app"))
+        text = json.loads(out)["messages"][0]["content"][0]["text"]
+        self.assertIn("the [REDACTED:known-secret] value", text)
+        self.assertIn("app:[REDACTED:url-password]@db", text)
+
     def test_short_listed_secret_matches_whole_words_only(self):
         SECRETS.write_text("k9x2\n")
         out, counts = self.redact(body_of("pin k9x2 here; also k9x2z and ak9x2 stay"))
