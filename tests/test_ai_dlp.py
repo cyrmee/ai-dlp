@@ -906,12 +906,18 @@ class RequestStoreTests(unittest.TestCase):
         self.assertFalse(self.dir.exists() and any(self.dir.iterdir()))
 
     def test_socket_owner_is_read_from_proc(self):
-        table = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-                 "   0: 0100007F:4762 00000000:0000 0A 00000000:00000000 00:00000000 00000000   977        0 1\n"
-                 "   1: 8920A8C0:D431 0A684FA0:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2\n")
-        self.assertEqual(dlp.uid_from_proc(table, "192.168.32.137", 0xD431), 1000)
-        self.assertIsNone(dlp.uid_from_proc(table, "127.0.0.1", 0x4762))  # listening socket
-        self.assertIsNone(dlp.uid_from_proc(table, "10.0.0.1", 0xD431))
+        head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        row = "   {n}: {l} {r} {st} 00000000:00000000 00:00000000 00000000  {uid}        0 {n}\n"
+        mine = row.format(n=1, l="8920A8C0:D431", r="0A684FA0:01BB", st="01", uid=1000)  # 192.168.32.137:54321 -> 160.79.104.10:443
+        listening = row.format(n=0, l="0100007F:4762", r="00000000:0000", st="0A", uid=977)
+        table = head + listening + mine
+        self.assertEqual(dlp.uid_from_proc(table, "192.168.32.137", 0xD431, "160.79.104.10", 443), 1000)
+        self.assertIsNone(dlp.uid_from_proc(table, "192.168.32.137", 0xD431, "1.2.3.4", 443))   # other destination
+        self.assertIsNone(dlp.uid_from_proc(table, "127.0.0.1", 0x4762, "0.0.0.0", 0))         # listening socket
+        same_local_other_dest = row.format(n=2, l="8920A8C0:D431", r="04030201:01BB", st="01", uid=1001)
+        self.assertEqual(dlp.uid_from_proc(table + same_local_other_dest, "192.168.32.137", 0xD431, "160.79.104.10", 443), 1000)
+        clash = row.format(n=3, l="8920A8C0:D431", r="0A684FA0:01BB", st="01", uid=1001)
+        self.assertIsNone(dlp.uid_from_proc(table + clash, "192.168.32.137", 0xD431, "160.79.104.10", 443))  # ambiguous
 
     def test_nothing_is_stored_when_capture_is_off(self):
         dlp.KEEP_REQUESTS = 0

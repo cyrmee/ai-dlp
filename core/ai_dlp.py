@@ -837,32 +837,43 @@ def _proc_ip(hexaddr: str) -> str:
     return str(addr.ipv4_mapped or addr)
 
 
-def uid_from_proc(table: str, ip: str, port: int) -> int | None:
-    """The uid owning the socket whose local address is ip:port, from /proc/net/tcp(6) text."""
-    want_port = f"{port:04X}"
+def uid_from_proc(table: str, ip: str, port: int, rip: str, rport: int) -> int | None:
+    """The uid owning the TCP socket ip:port -> rip:rport, from /proc/net/tcp(6) text.
+
+    Both ends must match. If entries for that exact connection disagree about the owner,
+    None is returned: a request is never attributed to an account by guesswork.
+    """
+    uids = set()
     for line in table.splitlines()[1:]:
         cols = line.split()
-        if len(cols) < 8 or ":" not in cols[1]:
+        if len(cols) < 8 or ":" not in cols[1] or ":" not in cols[2] or cols[3] == "0A":  # 0A = listening
             continue
-        addr, lport = cols[1].rsplit(":", 1)
-        if lport.upper() == want_port and cols[3] != "0A":  # 0A = listening
-            try:
-                if _proc_ip(addr) == ip:
-                    return int(cols[7])
-            except ValueError:
-                continue
-    return None
+        laddr, lport = cols[1].rsplit(":", 1)
+        raddr, rport_hex = cols[2].rsplit(":", 1)
+        try:
+            if (int(lport, 16) == port and int(rport_hex, 16) == rport
+                    and _proc_ip(laddr) == ip and _proc_ip(raddr) == rip):
+                uids.add(int(cols[7]))
+        except ValueError:
+            continue
+    return uids.pop() if len(uids) == 1 else None
 
 
 def client_uid(flow) -> int | None:
     """Which local account opened this connection (Linux; None if unknown)."""
     peer = getattr(getattr(flow, "client_conn", None), "peername", None)
-    if not (isinstance(peer, tuple) and len(peer) >= 2):
+    # The original destination: the app's own socket still points there (NAT is invisible to it).
+    dest = getattr(getattr(flow, "server_conn", None), "address", None)
+    if not (isinstance(peer, tuple) and len(peer) >= 2 and isinstance(dest, tuple) and len(dest) >= 2):
         return None
-    ip = str(peer[0]).removeprefix("::ffff:")
+    ip, rip = str(peer[0]).removeprefix("::ffff:"), str(dest[0]).removeprefix("::ffff:")
+    try:
+        socket.inet_pton(socket.AF_INET6 if ":" in rip else socket.AF_INET, rip)
+    except OSError:
+        return None  # not an address (a hostname): cannot match the socket table exactly
     for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
-            uid = uid_from_proc(Path(table).read_text(), ip, int(peer[1]))
+            uid = uid_from_proc(Path(table).read_text(), ip, int(peer[1]), rip, int(dest[1]))
         except OSError:
             continue
         if uid is not None:
