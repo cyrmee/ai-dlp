@@ -319,9 +319,63 @@ def _readable_runs(raw: bytes) -> str:
 _MEDIA: contextvars.ContextVar[list[bytes] | None] = contextvars.ContextVar("ai_dlp_media", default=None)
 
 OCR_MAX_BYTES = 25_000_000
-OCR_MAX_PAGES = 20      # scanned (text-less) PDF pages OCR'd per document
-OCR_TIMEOUT = 60        # seconds per tool run
+OCR_MAX_PAGES = 20          # PDF pages OCR'd per document (text-less pages and pages with images)
+OCR_MAX_PIXELS = 40_000_000 # larger images are refused rather than OCR'd
+OCR_PAGE_PIXELS = 2000      # PDF pages are rendered at most this many pixels on the longest side
+OCR_TIMEOUT = 60            # seconds per tool run
+OCR_REQUEST_DEADLINE = 180  # seconds of OCR per request, in total
+OCR_MAX_ITEMS = 20          # new (not cached) images/PDFs OCR'd per request
+OCR_MEMORY = 2 << 30        # address-space limit for OCR tools (POSIX)
+OCR_FILE_SIZE = 512 << 20   # largest file an OCR tool may write (POSIX)
 OCR_CACHE = 2_000
+
+
+def image_size(raw: bytes) -> tuple[int, int] | None:
+    """(width, height) from a PNG, GIF, JPEG or WebP header, or None if not recognised."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n") and raw[12:16] == b"IHDR":
+        return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return int.from_bytes(raw[6:8], "little"), int.from_bytes(raw[8:10], "little")
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        chunk = raw[12:16]
+        if chunk == b"VP8X":
+            return 1 + int.from_bytes(raw[24:27], "little"), 1 + int.from_bytes(raw[27:30], "little")
+        if chunk == b"VP8L":
+            b = int.from_bytes(raw[21:25], "little")
+            return 1 + (b & 0x3FFF), 1 + ((b >> 14) & 0x3FFF)
+        if chunk == b"VP8 ":
+            return int.from_bytes(raw[26:28], "little") & 0x3FFF, int.from_bytes(raw[28:30], "little") & 0x3FFF
+    if raw[:2] == b"\xff\xd8":  # JPEG: walk segments to a start-of-frame marker
+        i = 2
+        while i + 9 < len(raw):
+            if raw[i] != 0xFF:
+                i += 1
+                continue
+            marker = raw[i + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            length = int.from_bytes(raw[i + 2:i + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                return int.from_bytes(raw[i + 7:i + 9], "big"), int.from_bytes(raw[i + 5:i + 7], "big")
+            i += 2 + length
+    return None
+
+
+def pages_with_images(listing: str) -> set[int]:
+    """Page numbers that embed images, from `pdfimages -list` output."""
+    pages = set()
+    for line in listing.splitlines()[2:]:  # two header lines
+        first = line.split(None, 1)[0] if line.strip() else ""
+        if first.isdigit():
+            pages.add(int(first))
+    return pages
+
+
+def _limit_resources() -> None:  # runs in the OCR tool's process before exec (POSIX)
+    import resource
+    resource.setrlimit(resource.RLIMIT_AS, (OCR_MEMORY, OCR_MEMORY))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (OCR_FILE_SIZE, OCR_FILE_SIZE))
 
 
 class OCR:
@@ -335,6 +389,7 @@ class OCR:
         self.tesseract = shutil.which("tesseract")
         self.pdftotext = shutil.which("pdftotext")
         self.pdftoppm = shutil.which("pdftoppm")
+        self.pdfimages = shutil.which("pdfimages")
         self.cache: OrderedDict[bytes, str] = OrderedDict()
         if not self.tesseract:
             log.info("ai-dlp: tesseract not found; images and PDFs get the readable-text scan only")
@@ -344,13 +399,15 @@ class OCR:
         return bool(self.tesseract)
 
     async def _run(self, cmd: list[str], data: bytes | None) -> bytes:
+        extra = {"preexec_fn": _limit_resources} if os.name == "posix" else {}
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **extra)
         try:
             out, err = await asyncio.wait_for(proc.communicate(data), OCR_TIMEOUT)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             proc.kill()
+            await proc.wait()
             raise ScanError(f"{Path(cmd[0]).name} timed out reading an image or PDF")
         if proc.returncode != 0:
             raise ScanError(f"{Path(cmd[0]).name} could not read an image or PDF: "
@@ -358,29 +415,38 @@ class OCR:
         return out
 
     async def _image(self, raw: bytes) -> str:
+        size = image_size(raw)
+        if size and size[0] * size[1] > OCR_MAX_PIXELS:
+            raise ScanError(f"image of {size[0]}x{size[1]} pixels is too large to check for secrets")
         return (await self._run([self.tesseract, "stdin", "stdout", "-l", "eng"], raw)).decode("utf-8", "replace")
 
     async def _pdf(self, raw: bytes) -> str:
-        if not (self.pdftotext and self.pdftoppm):
-            raise ScanError("PDF text cannot be checked: poppler (pdftotext, pdftoppm) is not installed")
-        text = (await self._run([self.pdftotext, "-layout", "-", "-"], raw)).decode("utf-8", "replace")
-        pages = text.split("\f")
-        if pages and not pages[-1].strip():
-            pages = pages[:-1]
-        scanned = [n for n, page in enumerate(pages, 1) if len(page.strip()) < 20]
-        if len(scanned) > OCR_MAX_PAGES:
-            raise ScanError(f"PDF has {len(scanned)} pages without a text layer; OCR is limited to {OCR_MAX_PAGES}")
-        parts = [text]
-        if scanned:
-            with tempfile.TemporaryDirectory(prefix="ai-dlp-ocr-") as tmp:
-                src = Path(tmp) / "in.pdf"
-                src.write_bytes(raw)
-                for n in scanned:
-                    out = Path(tmp) / f"p{n}"
-                    await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", "200", "-png",
-                                     "-singlefile", str(src), str(out)], None)
-                    parts.append(await self._image(out.with_suffix(".png").read_bytes()))
+        if not (self.pdftotext and self.pdftoppm and self.pdfimages):
+            raise ScanError("PDF text cannot be checked: poppler (pdftotext, pdftoppm, pdfimages) is not installed")
+        with tempfile.TemporaryDirectory(prefix="ai-dlp-ocr-") as tmp:
+            src = Path(tmp) / "in.pdf"
+            src.write_bytes(raw)
+            text = (await self._run([self.pdftotext, "-layout", str(src), "-"], None)).decode("utf-8", "replace")
+            pages = text.split("\f")
+            if pages and not pages[-1].strip():
+                pages = pages[:-1]
+            # OCR every page without a text layer (scans) AND every page that embeds an
+            # image (a screenshot inside a text document), whatever its text layer says.
+            listing = (await self._run([self.pdfimages, "-list", str(src)], None)).decode("utf-8", "replace")
+            need = {n for n, page in enumerate(pages, 1) if len(page.strip()) < 20} | pages_with_images(listing)
+            if len(need) > OCR_MAX_PAGES:
+                raise ScanError(f"PDF has {len(need)} pages with images or without text; OCR is limited "
+                                f"to {OCR_MAX_PAGES}")
+            parts = [text]
+            for n in sorted(need):
+                out = Path(tmp) / f"p{n}"
+                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-scale-to", str(OCR_PAGE_PIXELS),
+                                 "-png", "-singlefile", str(src), str(out)], None)
+                parts.append(await self._image(out.with_suffix(".png").read_bytes()))
         return "\n".join(parts)
+
+    def cached(self, raw: bytes) -> bool:
+        return hashlib.sha256(raw).digest() in self.cache
 
     async def text_of(self, raw: bytes) -> str | None:
         if not self.available:
@@ -534,11 +600,20 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
     # Text read from images and PDFs. A secret found there cannot be blacked out inside
     # the file, so it blocks the request (below).
     ocr_texts = []
-    if ocr is not None:
-        for raw in media:
-            text = await ocr.text_of(raw)
-            if text:
-                ocr_texts.append(text)
+    if ocr is not None and ocr.available and media:
+        new = sum(1 for raw in media if not ocr.cached(raw))
+        if new > OCR_MAX_ITEMS:
+            raise ScanError(f"{new} new images/PDFs in one request; at most {OCR_MAX_ITEMS} are checked at a time")
+
+        async def read_all():
+            for raw in media:
+                text = await ocr.text_of(raw)
+                if text:
+                    ocr_texts.append(text)
+        try:
+            await asyncio.wait_for(read_all(), OCR_REQUEST_DEADLINE)
+        except asyncio.TimeoutError:
+            raise ScanError(f"reading the images/PDFs in this request took over {OCR_REQUEST_DEADLINE} s") from None
     for secret in known:
         if any(contains_secret(t, secret) for t in ocr_texts):
             raise ScanError("a listed secret appears in the text of an image or PDF")

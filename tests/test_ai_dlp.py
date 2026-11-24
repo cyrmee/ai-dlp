@@ -715,6 +715,38 @@ class OCRTests(unittest.TestCase):
         with self.assertRaises(dlp.ScanError):
             run(dlp.redact(self.block("image", "image/png", png), ["Zebra7731"], self.gl, "application/json", self.ocr))
 
+    def test_screenshot_inside_a_text_pdf_is_ocrd(self):
+        listing = ("page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio\n"
+                   "--------------------------------------------------------------------------------------------\n"
+                   "   2     0 image     800   600  rgb     3   8  image  no         9  0   144   144 30.1K 2.1%\n"
+                   "   5     1 image     400   300  rgb     3   8  jpeg   no        12  0    96    96 12.0K 3.4%\n")
+        self.assertEqual(dlp.pages_with_images(listing), {2, 5})
+        self.assertEqual(dlp.pages_with_images(listing.splitlines()[0] + "\n---\n"), set())
+
+    def test_oversized_image_is_refused_before_ocr(self):
+        huge_png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + (50000).to_bytes(4, "big") + \
+            (50000).to_bytes(4, "big") + b"\x08\x02\x00\x00\x00" + os.urandom(64)
+        self.assertEqual(dlp.image_size(huge_png), (50000, 50000))
+        with self.assertRaises(dlp.ScanError) as e:
+            run(self.ocr._image(huge_png))
+        self.assertIn("too large", str(e.exception))
+
+    def test_image_sizes_are_read_from_headers(self):
+        png = _png_of(_pdf_with_lines("x"))
+        w, h = dlp.image_size(png)
+        self.assertGreater(w, 100)
+        self.assertGreater(h, 100)
+        self.assertEqual(dlp.image_size(b"GIF89a" + (320).to_bytes(2, "little") + (200).to_bytes(2, "little")), (320, 200))
+
+    def test_too_many_new_images_in_one_request_is_blocked(self):
+        import base64 as b64
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                   "data": b64.b64encode(b"\x89PNG\r\n\x1a\n" + os.urandom(40)).decode()}} for _ in range(dlp.OCR_MAX_ITEMS + 1)]
+        body = json.dumps({"messages": [{"role": "user", "content": blocks}]}).encode()
+        with self.assertRaises(dlp.ScanError) as e:
+            run(dlp.redact(body, [], self.gl, "application/json", self.ocr))
+        self.assertIn("at most", str(e.exception))
+
     def test_clean_image_passes_and_is_ocrd_once(self):
         png = _png_of(_pdf_with_lines("quarterly report", "nothing secret here"))
         body = self.block("image", "image/png", png)
