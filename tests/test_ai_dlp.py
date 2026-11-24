@@ -120,6 +120,13 @@ class RedactTests(unittest.TestCase):
         self.assertIn("the [REDACTED:known-secret] value", text)
         self.assertIn("app:[REDACTED:url-password]@db", text)
 
+    def test_secret_hidden_in_a_fake_marker_is_still_caught(self):
+        SECRETS.write_text("Zebra7731\n")
+        hidden = "".join(f"\\u{ord(c):04x}" for c in "Zebra7731")  # decodes to the secret
+        body = ('{"messages":[{"role":"user","content":"x [REDACTED:' + hidden + '] y"}]}').encode()
+        with self.assertRaises(dlp.ScanError):
+            self.redact(body)
+
     def test_short_listed_secret_matches_whole_words_only(self):
         SECRETS.write_text("k9x2\n")
         out, counts = self.redact(body_of("pin k9x2 here; also k9x2z and ak9x2 stay"))
