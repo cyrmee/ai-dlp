@@ -29,6 +29,19 @@ Panel {
   property var detailEntry: null
   property double now: Date.now()
 
+  function escapeMarkup(text) {
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;")
+  }
+
+  // Plain text with every [REDACTED:rule] marker in bold accent; the rest is escaped.
+  function highlight(text) {
+    var colour = String(accent)
+    return escapeMarkup(text).replace(/\[REDACTED:[A-Za-z0-9_.\-]{1,64}\]/g, function(m) {
+      return "<b><font color=\"" + colour + "\">" + m + "</font></b>"
+    })
+  }
+
   function setFilter(category) {
     filter = filter === category ? "all" : category
   }
@@ -422,73 +435,74 @@ Panel {
       color: dlp.detailLoading ? root.dim : root.urgent
     }
 
+    // What was redacted: each change with a little of the text around it. The copy is
+    // stored after redaction, so the secret itself never appears here.
     Column {
       visible: dv.d !== null && !dv.d.error
       width: parent.width
-      spacing: Style.space(6)
+      spacing: Style.space(8)
 
       PanelSectionHeader {
-        text: strings.t("detail.headers")
+        text: dv.d && dv.d.total > 0
+          ? strings.tn("detail.changes", dv.d.total).arg(Commons.I18n.formatNumber(dv.d.total))
+          : strings.t("detail.changesTitle")
         foreground: root.foreground
         fontFamily: root.fontFamily
+      }
+
+      Caption {
+        visible: dv.d !== null && dv.d.changes.length === 0
+        text: !dv.d ? "" : (!dv.d.stored ? strings.t("detail.blockedBody")
+          : (dv.entry.action === "allowed" ? strings.t("detail.nothingRedacted") : strings.t("detail.noPreview")))
+        color: dv.d && !dv.d.stored ? root.urgent : root.dim
       }
 
       Repeater {
-        model: dv.d && dv.d.headers ? dv.d.headers : []
-        Text {
+        model: dv.d ? dv.d.changes : []
+        BorderSurface {
           required property var modelData
           width: parent.width
-          textFormat: Text.PlainText
-          text: modelData[0] + ": " + modelData[1]
-          color: modelData[1] === "[hidden]" ? root.faint : root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WrapAnywhere
+          implicitHeight: changeColumn.implicitHeight + Style.space(14)
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
+          radius: Style.cornerRadius
+          borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
+
+          Column {
+            id: changeColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.margins: Style.space(8)
+            spacing: Style.space(3)
+
+            Text {
+              textFormat: Text.PlainText
+              text: modelData.rule + (modelData.count > 1 ? "  ×" + Commons.I18n.formatNumber(modelData.count) : "")
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            // Escaped first, so only the [REDACTED:…] markers are styled and nothing in the
+            // request can act as markup.
+            Text {
+              width: parent.width
+              textFormat: Text.StyledText
+              text: root.highlight(modelData.before + "[REDACTED:" + modelData.rule + "]" + modelData.after)
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WrapAnywhere
+            }
+          }
         }
       }
 
       Caption {
-        text: strings.t("detail.masked")
-        color: root.faint
-      }
-
-      Item { width: 1; height: Style.space(4) }
-
-      PanelSectionHeader {
-        text: strings.t("detail.payload")
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-      }
-
-      Caption {
-        visible: dv.d !== null && (dv.d.body === null || dv.d.truncated)
-        text: dv.d && dv.d.body === null ? strings.t("detail.blockedBody") : strings.t("detail.truncated")
-        color: dv.d && dv.d.body === null ? root.urgent : root.dim
-      }
-
-      BorderSurface {
-        visible: dv.d !== null && dv.d.body !== null
-        width: parent.width
-        implicitHeight: payloadText.implicitHeight + Style.space(16)
-        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
-        radius: Style.cornerRadius
-        borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
-
-        // Selectable, so parts can be copied with the mouse and Ctrl+C.
-        TextEdit {
-          id: payloadText
-          anchors.fill: parent
-          anchors.margins: Style.space(8)
-          readOnly: true
-          selectByMouse: true
-          textFormat: TextEdit.PlainText
-          text: dv.d && dv.d.body !== null ? dv.d.body : ""
-          color: root.foreground
-          selectionColor: root.accent
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: TextEdit.WrapAnywhere
-        }
+        visible: dv.d !== null && dv.d.distinct > dv.d.changes.length
+        text: dv.d ? strings.t("detail.more").arg(Commons.I18n.formatNumber(dv.d.distinct - dv.d.changes.length)) : ""
+        color: root.dim
       }
     }
   }

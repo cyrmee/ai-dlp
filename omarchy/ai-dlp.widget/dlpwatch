@@ -3,7 +3,8 @@
 
   dlpwatch watch        stream one JSON state object per line whenever something changes
   dlpwatch status       print the current state once
-  dlpwatch detail ID    print one stored request: {method, host, path, headers, body, truncated, file}
+  dlpwatch detail ID    print what was redacted in one stored request:
+                        {method, host, path, changes: [{rule, before, after, count}], total, file}
 
 State: {installed, proxy, firewall, counts: {allowed, redacted, blocked, attachments} (today),
         recent: [newest-first events, at most RECENT], error}
@@ -25,7 +26,9 @@ EVENTS = Path(os.environ.get("AI_DLP_EVENTS", "/var/log/ai-dlp/events.jsonl"))
 ROTATED = EVENTS.with_name(EVENTS.name + ".1")
 RECENT = 200
 REQUESTS = Path(os.environ.get("AI_DLP_REQUESTS_DIR", "/var/log/ai-dlp/requests"))
-DETAIL_BODY_LIMIT = 200_000   # characters shown in the panel; the full copy opens in an editor
+CONTEXT = 70          # characters of surrounding text shown on each side of a redaction
+MAX_CHANGES = 30
+REDACTION = re.compile(r"\[REDACTED:([A-Za-z0-9_.\-]{1,64})\]")
 REQUEST_ID = re.compile(r"^\d{13}-[0-9a-f]{8}$")
 POLL = 0.5
 STATUS_EVERY = 5.0
@@ -184,18 +187,55 @@ def detail(rid):
     except (OSError, ValueError) as e:
         return {"error": f"could not read the stored request: {e}"[:200]}
     body = record.get("body")
-    shown = body[:DETAIL_BODY_LIMIT] if isinstance(body, str) else None
-    headers = [[bounded(h[0], 100), bounded(h[1], 2000)] for h in (record.get("headers") or [])[:200]
-               if isinstance(h, list) and len(h) == 2]
     return {
         "method": bounded(record.get("method"), 10),
         "host": bounded(record.get("host"), 253),
         "path": bounded(record.get("path"), 2000),
-        "headers": headers,
-        "body": shown,
-        "truncated": bool(record.get("truncated")) or (isinstance(body, str) and len(body) > DETAIL_BODY_LIMIT),
+        "stored": isinstance(body, str),
+        **changes(body if isinstance(body, str) else ""),
         "file": str(path),
     }
+
+
+def _squash(text):
+    return re.sub(r"\s+", " ", text)
+
+
+def _strings(obj, out):
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _strings(value, out)
+    elif isinstance(obj, list):
+        for value in obj:
+            _strings(value, out)
+
+
+def changes(body):
+    """Each redaction with a little of the text around it, taken from inside the text value
+    that holds it (so no JSON wrapping). The stored copy is already redacted, so no secret
+    value can appear here. Identical snippets (a conversation resends the same text every
+    turn) are counted once."""
+    try:
+        texts = []
+        _strings(json.loads(body), texts)
+    except ValueError:
+        texts = [body]
+    found, order = {}, []
+    for text in texts:
+        for m in REDACTION.finditer(text):
+            before = _squash(text[max(0, m.start() - CONTEXT * 2):m.start()])
+            after = _squash(text[m.end():m.end() + CONTEXT * 2])
+            before = ("…" + before[-CONTEXT:].lstrip()) if len(before) > CONTEXT or m.start() > CONTEXT * 2 else before
+            after = (after[:CONTEXT].rstrip() + "…") if len(after) > CONTEXT or len(text) - m.end() > CONTEXT * 2 else after
+            key = (m.group(1), before, after)
+            if key not in found:
+                found[key] = 0
+                order.append(key)
+            found[key] += 1
+    items = [{"rule": r, "before": b, "after": a, "count": found[(r, b, a)]} for r, b, a in order]
+    return {"changes": items[:MAX_CHANGES], "total": sum(found.values()), "distinct": len(items)}
 
 
 def main(argv):

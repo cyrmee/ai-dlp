@@ -43,14 +43,14 @@ Item {
   // "redacted", "blocked" or "attachment" for a few seconds after one happens, for the bar icon.
   property string flash: ""
 
-  // The request opened in the detail view: { method, host, path, headers: [[name, value]],
-  // body, truncated, file, error }, or null. Loaded on demand from the stored copy.
+  // The request opened in the detail view: { method, host, path, stored, changes:
+  // [{ rule, before, after, count }], total, distinct, file, error }, or null.
   property var detail: null
   readonly property bool detailLoading: detailProcess.running
 
   function loadDetail(id) {
     if (!/^\d{13}-[0-9a-f]{8}$/.test(String(id || ""))) {
-      detail = { error: t("detail.notStored"), headers: [], body: null }
+      detail = { error: t("detail.notStored"), changes: [], stored: false }
       return
     }
     detail = null
@@ -61,13 +61,16 @@ Item {
   function applyDetail(raw) {
     var d
     try { d = JSON.parse(String(raw || "")) } catch (e) { d = { error: t("detail.readFailed") } }
-    var headers = Array.isArray(d.headers) ? d.headers.slice(0, 200).map(function(h) {
-      return [bounded(h[0], 100), bounded(h[1], 2000)]
+    var changes = Array.isArray(d.changes) ? d.changes.slice(0, 30).map(function(c) {
+      var rule = /^[A-Za-z0-9_.\-]{1,64}$/.test(String(c.rule || "")) ? String(c.rule) : "secret"
+      return { rule: rule, before: bounded(c.before, 400), after: bounded(c.after, 400),
+               count: Math.max(1, parseInt(c.count, 10) || 1) }
     }) : []
     detail = {
       method: bounded(d.method, 10), host: bounded(d.host, 253), path: bounded(d.path, 2000),
-      headers: headers, body: d.body === null || d.body === undefined ? null : bounded(d.body, 200000),
-      truncated: d.truncated === true, file: bounded(d.file, 300), error: bounded(d.error, 200)
+      stored: d.stored === true, changes: changes,
+      total: Math.max(0, parseInt(d.total, 10) || 0), distinct: Math.max(0, parseInt(d.distinct, 10) || 0),
+      file: bounded(d.file, 300), error: bounded(d.error, 200)
     }
   }
 
