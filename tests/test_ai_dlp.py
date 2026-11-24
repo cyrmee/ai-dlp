@@ -747,6 +747,16 @@ class OCRTests(unittest.TestCase):
             run(dlp.redact(body, [], self.gl, "application/json", self.ocr))
         self.assertIn("at most", str(e.exception))
 
+    def test_page_sizes_are_parsed(self):
+        self.assertEqual(dlp.page_sizes("Pages: 2\nPage    1 size:  612 x 792 pts (letter)\nPage    1 rot:   0\n"
+                                        "Page    2 size:  5000.5 x 300 pts\n"), {1: (612.0, 792.0), 2: (5000.5, 300.0)})
+
+    def test_giant_page_is_refused_not_shrunk(self):
+        pdf = _pdf_with_lines("password=Kangaroo42").replace(b"/MediaBox [0 0 612 792]", b"/MediaBox [0 0 9000 9000]")
+        with self.assertRaises(dlp.ScanError) as e:  # its text layer already catches it; force the OCR path:
+            run(self.ocr._pdf(pdf.replace(b"(password=Kangaroo42) Tj", b"")))
+        self.assertIn("too large", str(e.exception))
+
     def test_clean_image_passes_and_is_ocrd_once(self):
         png = _png_of(_pdf_with_lines("quarterly report", "nothing secret here"))
         body = self.block("image", "image/png", png)

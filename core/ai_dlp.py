@@ -321,7 +321,8 @@ _MEDIA: contextvars.ContextVar[list[bytes] | None] = contextvars.ContextVar("ai_
 OCR_MAX_BYTES = 25_000_000
 OCR_MAX_PAGES = 20          # PDF pages OCR'd per document (text-less pages and pages with images)
 OCR_MAX_PIXELS = 40_000_000 # larger images are refused rather than OCR'd
-OCR_PAGE_PIXELS = 2000      # PDF pages are rendered at most this many pixels on the longest side
+OCR_DPI = 200               # PDF pages are rendered at this resolution, never shrunk to fit
+OCR_MAX_PDF_IMAGES = 50     # embedded images OCR'd (at native resolution) per PDF
 OCR_TIMEOUT = 60            # seconds per tool run
 OCR_REQUEST_DEADLINE = 180  # seconds of OCR per request, in total
 OCR_MAX_ITEMS = 20          # new (not cached) images/PDFs OCR'd per request
@@ -372,6 +373,14 @@ def pages_with_images(listing: str) -> set[int]:
     return pages
 
 
+def page_sizes(pdfinfo_output: str) -> dict[int, tuple[float, float]]:
+    """{page: (width, height) in points} from `pdfinfo -f 1 -l N` output."""
+    sizes = {}
+    for m in re.finditer(r"^Page\s+(\d+)\s+size:\s+([\d.]+)\s+x\s+([\d.]+)\s+pts", pdfinfo_output, re.M):
+        sizes[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+    return sizes
+
+
 def _limit_resources() -> None:  # runs in the OCR tool's process before exec (POSIX)
     import resource
     resource.setrlimit(resource.RLIMIT_AS, (OCR_MEMORY, OCR_MEMORY))
@@ -390,6 +399,7 @@ class OCR:
         self.pdftotext = shutil.which("pdftotext")
         self.pdftoppm = shutil.which("pdftoppm")
         self.pdfimages = shutil.which("pdfimages")
+        self.pdfinfo = shutil.which("pdfinfo")
         self.cache: OrderedDict[bytes, str] = OrderedDict()
         if not self.tesseract:
             log.info("ai-dlp: tesseract not found; images and PDFs get the readable-text scan only")
@@ -421,8 +431,9 @@ class OCR:
         return (await self._run([self.tesseract, "stdin", "stdout", "-l", "eng"], raw)).decode("utf-8", "replace")
 
     async def _pdf(self, raw: bytes) -> str:
-        if not (self.pdftotext and self.pdftoppm and self.pdfimages):
-            raise ScanError("PDF text cannot be checked: poppler (pdftotext, pdftoppm, pdfimages) is not installed")
+        if not (self.pdftotext and self.pdftoppm and self.pdfimages and self.pdfinfo):
+            raise ScanError("PDF text cannot be checked: poppler (pdftotext, pdftoppm, pdfimages, pdfinfo) "
+                            "is not installed")
         with tempfile.TemporaryDirectory(prefix="ai-dlp-ocr-") as tmp:
             src = Path(tmp) / "in.pdf"
             src.write_bytes(raw)
@@ -438,11 +449,33 @@ class OCR:
                 raise ScanError(f"PDF has {len(need)} pages with images or without text; OCR is limited "
                                 f"to {OCR_MAX_PAGES}")
             parts = [text]
+            if need:
+                info = (await self._run([self.pdfinfo, "-f", "1", "-l", str(max(need)), str(src)], None))
+                sizes = page_sizes(info.decode("utf-8", "replace"))
             for n in sorted(need):
+                # Rendered at a fixed resolution (never shrunk, which could make small text
+                # unreadable); a page too large at that resolution is refused instead.
+                w, h = sizes.get(n, (0, 0))
+                pixels = (w / 72 * OCR_DPI) * (h / 72 * OCR_DPI)
+                if not pixels or pixels > OCR_MAX_PIXELS:
+                    raise ScanError(f"PDF page {n} is too large to check for secrets at {OCR_DPI} dpi")
                 out = Path(tmp) / f"p{n}"
-                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-scale-to", str(OCR_PAGE_PIXELS),
+                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", str(OCR_DPI),
                                  "-png", "-singlefile", str(src), str(out)], None)
                 parts.append(await self._image(out.with_suffix(".png").read_bytes()))
+            # Embedded images at their native resolution too, so a high-resolution
+            # screenshot is read in full detail rather than as it appears on the page.
+            images = Path(tmp) / "images"
+            images.mkdir()
+            await self._run([self.pdfimages, "-png", str(src), str(images / "img")], None)
+            extracted = sorted(images.iterdir())
+            if len(extracted) > OCR_MAX_PDF_IMAGES:
+                raise ScanError(f"PDF embeds {len(extracted)} images; at most {OCR_MAX_PDF_IMAGES} are checked")
+            for f in extracted:
+                if f.suffix == ".png":
+                    parts.append(await self._image(f.read_bytes()))
+                else:  # formats pdfimages could not convert (e.g. JBIG2/CCITT as .pbm): unreadable here
+                    raise ScanError(f"PDF embeds an image ({f.suffix}) that cannot be checked for secrets")
         return "\n".join(parts)
 
     def cached(self, raw: bytes) -> bool:
