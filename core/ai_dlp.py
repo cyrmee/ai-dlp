@@ -40,6 +40,7 @@ import contextvars
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import sys
@@ -363,21 +364,39 @@ def image_size(raw: bytes) -> tuple[int, int] | None:
     return None
 
 
+def image_listing(listing: str) -> list[tuple[int, int, int]]:
+    """(page, width, height) of every embedded image, from `pdfimages -list` output."""
+    images = []
+    for line in listing.splitlines()[2:]:  # two header lines
+        cols = line.split()
+        if len(cols) >= 5 and cols[0].isdigit() and cols[3].isdigit() and cols[4].isdigit():
+            images.append((int(cols[0]), int(cols[3]), int(cols[4])))
+    return images
+
+
 def pages_with_images(listing: str) -> set[int]:
     """Page numbers that embed images, from `pdfimages -list` output."""
-    pages = set()
-    for line in listing.splitlines()[2:]:  # two header lines
-        first = line.split(None, 1)[0] if line.strip() else ""
-        if first.isdigit():
-            pages.add(int(first))
-    return pages
+    return {page for page, _, _ in image_listing(listing)}
 
 
 def page_sizes(pdfinfo_output: str) -> dict[int, tuple[float, float]]:
-    """{page: (width, height) in points} from `pdfinfo -f 1 -l N` output."""
+    """{page: (width, height) in points as rendered} from `pdfinfo -box -f 1 -l N` output.
+
+    Takes the larger of the MediaBox and CropBox in each direction (whichever box a
+    renderer uses, the page fits) and swaps the sides for pages rotated 90 or 270 degrees.
+    """
+    boxes: dict[int, list[tuple[float, float]]] = {}
+    rot: dict[int, int] = {}
+    for m in re.finditer(r"^Page\s+(\d+)\s+(MediaBox|CropBox):\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)",
+                         pdfinfo_output, re.M):
+        x1, y1, x2, y2 = (float(m.group(i)) for i in range(3, 7))
+        boxes.setdefault(int(m.group(1)), []).append((abs(x2 - x1), abs(y2 - y1)))
+    for m in re.finditer(r"^Page\s+(\d+)\s+rot:\s+(-?\d+)", pdfinfo_output, re.M):
+        rot[int(m.group(1))] = int(m.group(2)) % 360
     sizes = {}
-    for m in re.finditer(r"^Page\s+(\d+)\s+size:\s+([\d.]+)\s+x\s+([\d.]+)\s+pts", pdfinfo_output, re.M):
-        sizes[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+    for page, dims in boxes.items():
+        w, h = max(d[0] for d in dims), max(d[1] for d in dims)
+        sizes[page] = (h, w) if rot.get(page) in (90, 270) else (w, h)
     return sizes
 
 
@@ -444,23 +463,32 @@ class OCR:
             # OCR every page without a text layer (scans) AND every page that embeds an
             # image (a screenshot inside a text document), whatever its text layer says.
             listing = (await self._run([self.pdfimages, "-list", str(src)], None)).decode("utf-8", "replace")
+            embedded = image_listing(listing)
+            # Refuse before extracting anything: too many images, or any image too large.
+            if len(embedded) > OCR_MAX_PDF_IMAGES:
+                raise ScanError(f"PDF embeds {len(embedded)} images; at most {OCR_MAX_PDF_IMAGES} are checked")
+            for page, w, h in embedded:
+                if w * h > OCR_MAX_PIXELS:
+                    raise ScanError(f"PDF page {page} embeds a {w}x{h} image, too large to check for secrets")
             need = {n for n, page in enumerate(pages, 1) if len(page.strip()) < 20} | pages_with_images(listing)
             if len(need) > OCR_MAX_PAGES:
                 raise ScanError(f"PDF has {len(need)} pages with images or without text; OCR is limited "
                                 f"to {OCR_MAX_PAGES}")
             parts = [text]
             if need:
-                info = (await self._run([self.pdfinfo, "-f", "1", "-l", str(max(need)), str(src)], None))
+                info = (await self._run([self.pdfinfo, "-box", "-f", "1", "-l", str(max(need)), str(src)], None))
                 sizes = page_sizes(info.decode("utf-8", "replace"))
             for n in sorted(need):
                 # Rendered at a fixed resolution (never shrunk, which could make small text
                 # unreadable); a page too large at that resolution is refused instead.
                 w, h = sizes.get(n, (0, 0))
-                pixels = (w / 72 * OCR_DPI) * (h / 72 * OCR_DPI)
-                if not pixels or pixels > OCR_MAX_PIXELS:
+                wpx, hpx = math.ceil(w / 72 * OCR_DPI), math.ceil(h / 72 * OCR_DPI)
+                if not wpx or not hpx or wpx * hpx > OCR_MAX_PIXELS:
                     raise ScanError(f"PDF page {n} is too large to check for secrets at {OCR_DPI} dpi")
                 out = Path(tmp) / f"p{n}"
-                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", str(OCR_DPI),
+                # -W/-H cap the output at the size just checked, whatever the file claims.
+                await self._run([self.pdftoppm, "-f", str(n), "-l", str(n), "-r", str(OCR_DPI), "-cropbox",
+                                 "-x", "0", "-y", "0", "-W", str(wpx), "-H", str(hpx),
                                  "-png", "-singlefile", str(src), str(out)], None)
                 parts.append(await self._image(out.with_suffix(".png").read_bytes()))
             # Embedded images at their native resolution too, so a high-resolution

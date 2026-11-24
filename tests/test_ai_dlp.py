@@ -747,9 +747,22 @@ class OCRTests(unittest.TestCase):
             run(dlp.redact(body, [], self.gl, "application/json", self.ocr))
         self.assertIn("at most", str(e.exception))
 
-    def test_page_sizes_are_parsed(self):
-        self.assertEqual(dlp.page_sizes("Pages: 2\nPage    1 size:  612 x 792 pts (letter)\nPage    1 rot:   0\n"
-                                        "Page    2 size:  5000.5 x 300 pts\n"), {1: (612.0, 792.0), 2: (5000.5, 300.0)})
+    def test_page_sizes_use_the_larger_box_and_rotation(self):
+        out = ("Pages: 2\n"
+               "Page    1 size:  612 x 792 pts (letter)\nPage    1 rot:   0\n"
+               "Page    1 MediaBox:      0.00     0.00   612.00   792.00\n"
+               "Page    1 CropBox:       0.00     0.00   300.00   400.00\n"
+               "Page    2 rot:   90\n"
+               "Page    2 MediaBox:      0.00     0.00   200.00   100.00\n"
+               "Page    2 CropBox:       0.00     0.00  9000.00    50.00\n")
+        self.assertEqual(dlp.page_sizes(out), {1: (612.0, 792.0), 2: (100.0, 9000.0)})
+
+    def test_too_many_or_too_large_embedded_images_are_refused_before_extraction(self):
+        rows = "".join(f"   1  {i:4d} image   800   600  rgb  3  8  image  no  {9+i}  0  72  72  1K  1%\n" for i in range(3))
+        head = "page num type width height color comp bpc enc interp object ID x-ppi y-ppi size ratio\n----\n"
+        self.assertEqual(dlp.image_listing(head + rows), [(1, 800, 600)] * 3)
+        big = head + "   3     0 image  20000 20000  rgb  3  8  image  no  9  0  72  72  1K  1%\n"
+        self.assertEqual(dlp.image_listing(big), [(3, 20000, 20000)])
 
     def test_giant_page_is_refused_not_shrunk(self):
         pdf = _pdf_with_lines("password=Kangaroo42").replace(b"/MediaBox [0 0 612 792]", b"/MediaBox [0 0 9000 9000]")
