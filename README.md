@@ -114,6 +114,16 @@ Coding assistants (GitHub Copilot, Cursor, Codeium/Windsurf, Tabnine) are listed
 
 After editing the list, run the installer again (it issues a matching CA), then restart your browser and AI apps.
 
+### Google and Gemini in the browser
+
+Google's real certificates cover every `*.google.com` site, so Chrome can send a Gemini message over a connection it already opened to `www.google.com` or YouTube. ai-dlp would never inspect that connection.
+
+To close this gap, `domains.txt` has a `relay` section listing the domains on Google's shared certificates. Connections to those domains are:
+- decrypted with a certificate naming only the site asked for, so Chrome cannot reuse them for Gemini;
+- passed on without inspection or logging, except for requests that are actually for an inspected host.
+
+This means Google traffic (Gmail, Drive, YouTube) is decrypted inside the proxy, though never stored. The CA can also vouch for those domains. Remove the `relay` lines to opt out; Gemini in the browser is then not reliably inspected.
+
 ## Commands
 
 - `ai-dlp status`: is the proxy (and, on Linux, routing) running.

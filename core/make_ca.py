@@ -4,7 +4,7 @@
 usage: make_ca.py DOMAINS_FILE STATE_DIR CA_OUT      (CA_OUT "-" prints the certificate)
        make_ca.py --verify CERT_FILE DOMAINS_FILE    (exit 1 unless CERT_FILE is a proper ai-dlp CA)
 
-The CA may only vouch for the domains in DOMAINS_FILE and their subdomains (a
+The CA may only vouch for the domains in DOMAINS_FILE (inspected and relay) and their subdomains (a
 critical X.509 name constraint with DNS names only: an IP-address constraint makes
 some clients, Claude Code among them, reject every certificate it issues). If
 STATE_DIR already holds a CA with exactly those constraints it is kept; otherwise a
@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ai_dlp import parse_domains  # noqa: E402
+from ai_dlp import ca_domains  # noqa: E402
 
 from cryptography import x509  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
@@ -156,7 +156,7 @@ def new_ca(domains: tuple[str, ...]) -> tuple[bytes, bytes]:
 
 
 def ensure_ca(domains_file: Path, state: Path, ca_out: Path | None) -> tuple[tuple[str, ...], bool, bytes]:
-    domains = parse_domains(domains_file.read_text(encoding="utf-8", errors="replace"))
+    domains = ca_domains(domains_file.read_text(encoding="utf-8", errors="replace"))
     if not domains:
         raise SystemExit(f"No valid domains in {domains_file}")
     state.mkdir(parents=True, exist_ok=True)
@@ -180,7 +180,7 @@ def ensure_ca(domains_file: Path, state: Path, ca_out: Path | None) -> tuple[tup
 
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[0] == "--verify":
-        domains = parse_domains(Path(argv[2]).read_text(encoding="utf-8", errors="replace"))
+        domains = ca_domains(Path(argv[2]).read_text(encoding="utf-8", errors="replace"))
         problems = verify_ca_cert(Path(argv[1]).read_bytes(), domains)
         for problem in problems:
             print("ai-dlp CA check failed: " + problem, file=sys.stderr)

@@ -30,6 +30,12 @@ step "Installing files"
 install -dm755 "$ETC"
 install -m644 "$CORE/ai_dlp.py" "$CORE/make_ca.py" "$CORE/aidlp_tool.py" "$CORE/gitleaks.toml" "$SRC/ai-dlp.nft" "$ETC/"
 [[ -f $ETC/domains.txt ]] || install -m644 "$CORE/domains.txt" "$ETC/domains.txt"   # keep your edits
+# Upgrade from versions without relay entries: add the new default sections once.
+if ! grep -qE '^\s*relay ' "$ETC/domains.txt"; then
+  echo "Adding the Antigravity hosts and the Google relay list to $ETC/domains.txt"
+  { grep -qxF 'cloudcode-pa.googleapis.com' "$ETC/domains.txt" || printf '\n# Antigravity / Gemini CLI / Gemini Code Assist\ncloudcode-pa.googleapis.com\ndaily-cloudcode-pa.googleapis.com\n'
+    sed -n '/^# --- Relayed, not inspected/,$p' "$CORE/domains.txt"; } >> "$ETC/domains.txt"
+fi
 [[ -f $ETC/secrets.txt ]] || install -m640 -o root -g ai-dlp /dev/null "$ETC/secrets.txt"
 install -Dm755 "$SRC/merge-secrets" /usr/local/lib/ai-dlp/merge-secrets
 install -Dm755 "$SRC/ai-dlp" /usr/local/bin/ai-dlp

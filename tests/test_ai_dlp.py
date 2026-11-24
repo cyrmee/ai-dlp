@@ -823,6 +823,66 @@ class OCRTests(unittest.TestCase):
         self.assertEqual(calls, [])  # second time served from the OCR cache
 
 
+class RelayTests(unittest.TestCase):
+    def setUp(self):
+        DOMAINS.write_text("gemini.google.com\nrelay google.com\nrelay youtube.com\n")
+        EVENTS.unlink(missing_ok=True)
+        self.addon = dlp.AiDLP()
+
+    def tearDown(self):
+        DOMAINS.unlink(missing_ok=True)
+
+    def test_relay_lines_are_parsed_separately(self):
+        text = DOMAINS.read_text()
+        self.assertEqual(dlp.parse_domains(text), ("gemini.google.com",))
+        self.assertEqual(dlp.parse_relay(text), ("google.com", "youtube.com"))
+        self.assertEqual(dlp.ca_domains(text), ("gemini.google.com", "google.com", "youtube.com"))
+
+    def test_relay_connections_are_intercepted_others_pass_through(self):
+        t = DomainTests()
+        for sni, ignored in (("gemini.google.com", False), ("www.google.com", False),
+                             ("i.ytimg.youtube.com", False), ("example.com", True)):
+            data = t.hello(sni)
+            self.addon.tls_clienthello(data)
+            self.assertEqual(data.ignore_connection, ignored, sni)
+
+    def flow(self, sni, host, body):
+        req = AddonHookTests.Req(host, body)
+        req.headers.fields = [(b"content-type", b"application/json")]
+        return AddonHookTests.Flow(req, sni=sni)
+
+    def test_relayed_requests_are_not_inspected_or_logged(self):
+        aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
+        flow = self.flow("www.google.com", "www.google.com", body_of(f"k={aws}"))
+        run(self.addon.request(flow))
+        self.assertIn(aws.encode(), flow.request._body)   # relayed as is
+        self.assertFalse(EVENTS.exists() and EVENTS.read_text().strip())
+
+    def test_gemini_request_on_a_relayed_connection_is_still_inspected(self):
+        aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
+        flow = self.flow("www.google.com", "gemini.google.com", body_of(f"k={aws}"))
+        run(self.addon.request(flow))
+        self.assertNotIn(aws.encode(), flow.request._body)
+
+    def test_relayed_uploads_stream_inspected_ones_do_not(self):
+        relayed = self.flow("www.google.com", "www.google.com", b"x")
+        relayed.request.stream = False
+        self.addon.requestheaders(relayed)
+        self.assertTrue(relayed.request.stream)
+        inspected = self.flow("gemini.google.com", "gemini.google.com", b"x")
+        inspected.request.stream = False
+        self.addon.requestheaders(inspected)
+        self.assertFalse(inspected.request.stream)
+
+    def test_ca_covers_relay_domains(self):
+        from cryptography import x509
+        state, out = TMP / "relay-ca", TMP / "relay-ca.pem"
+        make_ca.ensure_ca(DOMAINS, state, out)
+        nc = x509.load_pem_x509_certificate(out.read_bytes()).extensions.get_extension_for_class(x509.NameConstraints)
+        self.assertEqual({t.value for t in nc.value.permitted_subtrees}, {"gemini.google.com", "google.com", "youtube.com"})
+        self.assertEqual(make_ca.verify_ca_cert(out.read_bytes(), dlp.ca_domains(DOMAINS.read_text())), [])
+
+
 class HiddenNameTests(unittest.TestCase):
     def setUp(self):
         DOMAINS.write_text("anthropic.com\n")

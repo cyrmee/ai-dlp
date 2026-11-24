@@ -24,6 +24,9 @@ openai.azure.com
 gemini.google.com
 aistudio.google.com
 generativelanguage.googleapis.com
+# Antigravity, Gemini CLI and Gemini Code Assist (signed in with a Google account)
+cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
 # Vertex AI uses regional hosts (us-central1-aiplatform.googleapis.com) that are not
 # subdomains of this entry; add the regions you use, e.g. us-central1-aiplatform.googleapis.com
 aiplatform.googleapis.com
@@ -60,3 +63,53 @@ api-inference.huggingface.co
 
 # Not coverable by domain suffix: AWS Bedrock (bedrock-runtime.<region>.amazonaws.com)
 # would require listing each regional host, e.g. bedrock-runtime.us-east-1.amazonaws.com
+
+# --- Relayed, not inspected -----------------------------------------------------
+# "relay <domain>": connections are decrypted with a certificate naming only the site
+# asked for, then passed on WITHOUT inspection or logging. This is needed where a site's
+# real certificate also covers an inspected domain: Google's certificates cover
+# *.google.com, so Chrome can send a Gemini message over a connection it opened to
+# www.google.com or YouTube, which would otherwise pass through uninspected.
+# These are the domains on Google's shared certificates. Remove this block to stop
+# decrypting Google traffic (Gemini in the browser is then not reliably inspected).
+relay google.com
+relay googleapis.com
+relay gstatic.com
+relay gvt1.com
+relay gvt2.com
+relay google-analytics.com
+relay googlecommerce.com
+relay urchin.com
+relay g.co
+relay goo.gl
+relay android.com
+relay ai.android
+relay bdn.dev
+relay youtube.com
+relay youtu.be
+relay yt.be
+relay ytimg.com
+relay youtube-nocookie.com
+relay youtube-3rd-party.com
+relay youtubeeducation.com
+relay youtubekids.com
+relay google.ca
+relay google.cl
+relay google.co.in
+relay google.co.jp
+relay google.co.uk
+relay google.com.ar
+relay google.com.au
+relay google.com.br
+relay google.com.co
+relay google.com.mx
+relay google.com.tr
+relay google.com.vn
+relay google.de
+relay google.es
+relay google.fr
+relay google.hu
+relay google.it
+relay google.nl
+relay google.pl
+relay google.pt

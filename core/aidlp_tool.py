@@ -142,6 +142,8 @@ def cmd_domains(args: list[str]) -> int:
     d = DomainList(Path(args[0]), Path(args[1]))
     for name in d.current():
         print(f"  inspected      {name}")
+    for name in d.relay:
+        print(f"  relayed        {name}  (decrypted, not inspected or logged)")
     for name in d.uncovered:
         print(f"  NOT inspected  {name}  (the CA does not cover it: run the installer again)")
     return 0

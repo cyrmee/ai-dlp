@@ -118,18 +118,41 @@ def encodings(value: str) -> list[bytes]:
     return [f.encode("utf-8", errors="surrogateescape") for f in forms]
 
 
-def parse_domains(text: str, warn=None) -> tuple[str, ...]:
-    """Valid domains from a domains.txt text: one per line, '#' comments, lowercased."""
+def _entries(text: str, relay: bool, warn=None) -> tuple[str, ...]:
     found = []
     for line in text.splitlines():
-        entry = line.split("#", 1)[0].strip().lower().rstrip(".")
+        entry = line.split("#", 1)[0].strip().lower()
         if not entry:
+            continue
+        is_relay = entry.startswith("relay ")
+        if is_relay:
+            entry = entry[len("relay "):].strip()
+        entry = entry.rstrip(".")
+        if is_relay != relay:
             continue
         if _DOMAIN_RX.match(entry):
             found.append(entry)
         elif warn:
             warn(entry)
     return tuple(dict.fromkeys(found))
+
+
+def parse_domains(text: str, warn=None) -> tuple[str, ...]:
+    """Domains to inspect, from a domains.txt text: one per line, '#' comments, lowercased."""
+    return _entries(text, relay=False, warn=warn)
+
+
+def parse_relay(text: str, warn=None) -> tuple[str, ...]:
+    """Domains to relay ("relay <domain>" lines): decrypted with a certificate for the exact
+    site only, then passed on without inspection or logging. Used for sites whose real
+    certificates also cover an inspected domain (Google's *.google.com covers Gemini), so a
+    browser cannot send inspected traffic over a connection opened to one of them."""
+    return _entries(text, relay=True, warn=warn)
+
+
+def ca_domains(text: str) -> tuple[str, ...]:
+    """Every domain the CA must cover: inspected and relayed."""
+    return tuple(dict.fromkeys(parse_domains(text) + parse_relay(text)))
 
 
 def _covered(domain: str, names) -> bool:
@@ -155,6 +178,7 @@ class DomainList:
         self.path, self.ca_path = path, ca_path
         self._stamp: tuple | None = None
         self.domains: tuple[str, ...] = DEFAULT_DOMAINS
+        self.relay: tuple[str, ...] = ()
         self.uncovered: tuple[str, ...] = ()
 
     @staticmethod
@@ -164,24 +188,25 @@ class DomainList:
         except OSError:
             return None
 
-    def _listed(self) -> tuple[str, ...]:
+    def _listed(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         if self._mtime(self.path) is None:
-            return DEFAULT_DOMAINS
-        return parse_domains(
-            self.path.read_text(encoding="utf-8", errors="replace"),
-            warn=lambda e: log.warning("ai-dlp: ignoring invalid domain %r in %s", e[:80], self.path))
+            return DEFAULT_DOMAINS, ()
+        text = self.path.read_text(encoding="utf-8", errors="replace")
+        warn = lambda e: log.warning("ai-dlp: ignoring invalid domain %r in %s", e[:80], self.path)  # noqa: E731
+        return parse_domains(text, warn), parse_relay(text, warn)
 
     def current(self) -> tuple[str, ...]:
         stamp = (self._mtime(self.path), self._mtime(self.ca_path))
         if stamp != self._stamp:
             self._stamp = stamp
-            listed = self._listed()
+            listed, relay = self._listed()
             permitted = ca_permitted_names(self.ca_path)
             if permitted is None:
-                self.domains, self.uncovered = listed, ()
+                self.domains, self.relay, self.uncovered = listed, relay, ()
             else:
                 self.domains = tuple(d for d in listed if _covered(d, permitted))
-                self.uncovered = tuple(d for d in listed if not _covered(d, permitted))
+                self.relay = tuple(d for d in relay if _covered(d, permitted))
+                self.uncovered = tuple(d for d in listed + relay if not _covered(d, permitted))
             log.info("ai-dlp: inspecting %d domain(s): %s", len(self.domains), ", ".join(self.domains))
             if self.uncovered:
                 log.warning("ai-dlp: NOT inspecting %s: the CA does not cover them yet; "
@@ -194,6 +219,13 @@ class DomainList:
             return False
         host = host.lower().rstrip(".")
         return any(host == d or host.endswith("." + d) for d in self.current())
+
+    def relayed(self, host: str | None) -> bool:
+        if not host:
+            return False
+        self.current()
+        host = host.lower().rstrip(".")
+        return any(host == d or host.endswith("." + d) for d in self.relay)
 
 
 class SecretList:
@@ -1043,6 +1075,10 @@ class AiDLP:
         """Decide per connection, from the TLS ClientHello.
 
         - A listed name (SNI): intercept, decrypt and inspect.
+        - A relay name (SNI): intercept with a certificate for that exact name, then pass the
+          traffic on without inspecting or logging it. The browser then cannot send an
+          inspected site's requests over this connection (as it could over one carrying the
+          site's real, many-name certificate); those requests are inspected by Host.
         - No name, or Encrypted Client Hello (which hides the real name), to an address
           known to serve a listed domain: intercept too. The request is then inspected,
           or the client refuses the proxy's certificate; it never passes unscanned.
@@ -1052,6 +1088,8 @@ class AiDLP:
         ip = _address_ip(getattr(getattr(data, "context", None), "server", None))
         if self.domains.matches(hello.sni):
             self._learn(ip)
+            return
+        if self.domains.relayed(hello.sni):
             return
         ech = any(ext[0] == ECH_EXTENSION for ext in (getattr(hello, "extensions", None) or []))
         if ip and ip in self.ai_addresses and (not hello.sni or ech):
@@ -1133,10 +1171,14 @@ class AiDLP:
         if echo:
             flow.response = http.Response.make(200, cleaned, {"content-type": "application/octet-stream"})
 
+    def requestheaders(self, flow) -> None:
+        # Relayed (not inspected) uploads stream straight through instead of being buffered.
+        if not self._inspected(flow):
+            flow.request.stream = True
+
     def responseheaders(self, flow) -> None:
-        # Stream responses (SSE) through untouched so Claude's output is not buffered.
-        if self._inspected(flow):
-            flow.response.stream = True
+        # Responses are never inspected: stream them all (SSE output, video, downloads).
+        flow.response.stream = True
 
     async def websocket_message(self, flow) -> None:
         if not self._inspected(flow):
