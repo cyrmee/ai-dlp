@@ -933,20 +933,38 @@ _FALLBACK_RULES = [(rule, re.compile(rx), group) for rule, rx, group in [
 ]]
 _FALLBACK_PLACEHOLDERS = re.compile(r"(?i)^(null|none|true|false|password|secret|changeme|example|x+|\*+|<[^>]*>|\[REDACTED:[^\]]*\]"
                                     r"|9007199254740991|9007199254740992|4503599627370496)$")
-# Variable references, templates and code, as in gitleaks.toml's password-assignment allowlist.
-_FALLBACK_CODE = re.compile(r"(?i)^(\$\{[^}]*\}|\$\([^)]*\)|\$[a-z_][a-z0-9_]*|\$[0-9]+|\{\{.*\}\}|%\([^)]*\)s|[a-z_][a-z0-9_.]*(\([^()]*\)[);,]*|[);,]+))$")
+# As in gitleaks.toml: variable references and templates (any password value), code
+# (only an unquoted password-assignment value, checked on the whole match) and, for
+# URL passwords, only an environment variable.
+# Placeholders: the same patterns as the rules' allowlists in gitleaks.toml (tested).
+_FALLBACK_PW_PLACEHOLDERS = re.compile(r"""(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|<[^>]*>)$""")
+_FALLBACK_URL_PLACEHOLDERS = re.compile(r"""(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+)$""")
+_FALLBACK_VARREF = re.compile(r"^(\$\{[^}]*\}|\$[A-Z_][A-Z0-9_]*|\$\([^)]*\)|\{\{.*\}\}|%\([^)]*\)s)$")
+_FALLBACK_CODE = re.compile(r"""(?i)[:=][ \t]{0,3}([a-z_][a-z_.]*(\([^()"']*\)[);,]*|[);,]+)|\$[0-9]+)[\r\n]?$""")
+_FALLBACK_URLVAR = re.compile(r"^\$[A-Z_][A-Z0-9_]*$")
 
 
-def fallback_scan(texts: list[str]) -> list[tuple[str, str]]:
+PASSWORD_RULES = ("password-assignment", "url-password")
+
+
+def fallback_scan(texts: list[str], only: tuple[str, ...] = ()) -> list[tuple[str, str]]:
     found = set()
+    rules = [r for r in _FALLBACK_RULES if not only or r[0] in only]
     for text in texts:
-        for rule, rx, group in _FALLBACK_RULES:
+        for rule, rx, group in rules:
             for m in rx.finditer(text):
                 # group None: the first alternative that matched (quoted or not)
                 secret = m.group(group) if group is not None else next((g for g in m.groups() if g), None)
-                if secret and not _FALLBACK_PLACEHOLDERS.match(secret) \
-                        and not (rule in ("password-assignment", "url-password") and _FALLBACK_CODE.match(secret)):
-                    found.add((rule, secret))
+                if not secret or _FALLBACK_PLACEHOLDERS.match(secret):
+                    continue
+                if rule == "url-password" and (_FALLBACK_URLVAR.match(secret)
+                                               or _FALLBACK_URL_PLACEHOLDERS.match(secret)):
+                    continue
+                if rule == "password-assignment" and (_FALLBACK_VARREF.match(secret)
+                                                      or _FALLBACK_PW_PLACEHOLDERS.match(secret)
+                                                      or _FALLBACK_CODE.search(m.group(0))):
+                    continue
+                found.add((rule, secret))
     return sorted(found, key=lambda rs: len(rs[1]), reverse=True)
 
 
@@ -1108,8 +1126,14 @@ async def _redact(body, known, gitleaks, content_type, ocr, notes):
         log.warning("ai-dlp: gitleaks failed (%s); using the built-in rules", e)
         _note(f"scanned with ai-dlp's built-in rules (gitleaks failed: {str(e)[:80]})")
         hits = fallback_scan(scanned)
+    # gitleaks' built-in global allowlist skips values shaped like $name (e.g. "$uperman1"),
+    # and no config can turn that off: ai-dlp's own password rules always run as well.
+    hits = list(set(hits) | set(fallback_scan(scanned, PASSWORD_RULES)))
     MARKER_LABELS.update(rule for rule, _ in hits)
-    hits = [(rule, secret) for rule, secret in hits if not is_own_marker(secret)]
+    # Longest first, so a secret that contains a shorter one (a grouped FAN holds a FIN-shaped
+    # prefix) is replaced whole.
+    hits = sorted({(rule, secret) for rule, secret in hits if not is_own_marker(secret)},
+                  key=lambda rs: (-len(rs[1]), rs))
     secrets = sorted(set(known_hits) | set(hits), key=lambda rs: len(rs[1]), reverse=True)
 
     # Images/PDFs holding a secret are removed (replaced by a note), not sent.

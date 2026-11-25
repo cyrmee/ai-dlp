@@ -133,12 +133,53 @@ class RedactTests(unittest.TestCase):
             out, counts = self.redact(body)
             self.assertEqual(out, body, text)
 
+    def test_quoted_values_and_lowercase_dollar_values_are_always_redacted(self):
+        # Quoted values are real strings even when they look like code; $lowercase is not an
+        # environment variable reference; URL passwords only skip $UPPER_CASE variables.
+        for template, value in (('password="getPw();"', "getPw();"), ("secret='abc;'", "abc;"),
+                                ('password="$abc12"', "$abc12"), ("password=$abc12", "$abc12"),
+                                ("postgres://app:$abc12@db/app", "$abc12"), ("password=abc1;", "abc1;")):
+            out, counts = self.redact(body_of(template))
+            self.assertNotIn(value.encode(), out, template)
+        for text in ('PASSWORD="${DB_PASS}"', 'PASSWORD="$DB_PASS"', "password: '{{ vault_pw }}'"):
+            body = body_of(text)
+            out, _ = self.redact(body)
+            self.assertEqual(out, body, text)
+
+    def test_dollar_passwords_skipped_by_gitleaks_are_still_redacted(self):
+        # Real gitleaks ignores values shaped like $name; ai-dlp's own password rules run too.
+        saved = self.gl.scan
+        async def no_hits(texts):
+            return []
+        self.gl.scan = no_hits
+        try:
+            out, counts = self.redact(body_of("password=$uperman1"))
+        finally:
+            self.gl.scan = saved
+        self.assertNotIn(b"$uperman1", out)
+        self.assertEqual(counts["password-assignment"], 1)
+
+    def test_built_in_password_rules_use_the_same_patterns_as_gitleaks_toml(self):
+        import tomllib
+        cfg = tomllib.loads((Path(dlp.__file__).parent / "gitleaks.toml").read_text())
+        rules = {r["id"]: r for r in cfg["rules"]}
+        def allow(rule, target="secret"):
+            return [x for al in rules[rule]["allowlists"] if al.get("regexTarget", "secret") == target
+                    for x in al["regexes"]]
+        self.assertEqual(allow("password-assignment"),
+                         [dlp._FALLBACK_PW_PLACEHOLDERS.pattern, dlp._FALLBACK_VARREF.pattern])
+        self.assertEqual(allow("password-assignment", "match"), [dlp._FALLBACK_CODE.pattern])
+        self.assertEqual(allow("url-password"), [dlp._FALLBACK_URL_PLACEHOLDERS.pattern, dlp._FALLBACK_URLVAR.pattern])
+
     def test_fallback_rules_match_the_gitleaks_rules(self):
         self.assertEqual(dlp.fallback_scan(["db_password=:_)47k2"]), [("password-assignment", ":_)47k2")])
         self.assertEqual(dlp.fallback_scan(['DB_PASSWORD="pa$$w0rd"']), [("password-assignment", "pa$$w0rd")])
         self.assertEqual(dlp.fallback_scan(["postgres://a:pa$$w0rd9@h/x"]), [("url-password", "pa$$w0rd9")])
         for text in ("password = getPassword();", "secret: ${X}", "password=None)", "postgres://a:$DB_PASS@h/x"):
             self.assertEqual(dlp.fallback_scan([text]), [], text)
+        for text, secret in (('password="getPw();"', "getPw();"), ("password=$abc12", "$abc12"),
+                             ("postgres://a:$abc12@h/x", "$abc12"), ("postgres://a:getX();@h/x", "getX();")):
+            self.assertEqual([s for _, s in dlp.fallback_scan([text])], [secret], text)
 
     def test_password_placeholders_are_left_alone(self):
         for text in ("password = null", "password: none", "pwd=true", "password=****", 'password="<value>"',

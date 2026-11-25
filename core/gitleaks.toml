@@ -19,13 +19,14 @@ secretGroup = 1
 keywords = ["://"]
 [[rules.allowlists]]
 regexTarget = "secret"
-regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|\$[a-z_][a-z0-9_]*)$''']
+regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+)$''',
+           '''^\$[A-Z_][A-Z0-9_]*$''']  # an environment variable, as in a shell script
 
 # password = "<value>", DB_PASSWORD=<value>, secret: <value>, client_secret: <value>
 # Values of 4+ characters: quoted, or unquoted at the end of a line. Any character may
 # be part of a password (`:_)$;,(` included). Not matched: variable references such as
-# ${DB_PASS}, $DB_PASS or $(cat file), templates such as {{ x }} or %(x)s, code such as
-# `password = getPassword();`, `this.password = password;` or `password: string,`, and
+# ${DB_PASS}, $DB_PASS or $(cat file), templates such as {{ x }} or %(x)s, unquoted code
+# such as `password = getPassword();`, `this.password = password;` or `password: string,`, and
 # placeholders such as null, none, true, changeme, **** or <value>.
 [[rules]]
 id = "password-assignment"
@@ -36,8 +37,12 @@ keywords = ["password", "passwd", "pwd", "secret"]
 regexTarget = "secret"
 regexes = [
   '''(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|<[^>]*>)$''',
-  '''(?i)^(\$\{[^}]*\}|\$\([^)]*\)|\$[a-z_][a-z0-9_]*|\$[0-9]+|\{\{.*\}\}|%\([^)]*\)s|[a-z_][a-z0-9_.]*(\([^()]*\)[);,]*|[);,]+))$''',
+  '''^(\$\{[^}]*\}|\$[A-Z_][A-Z0-9_]*|\$\([^)]*\)|\{\{.*\}\}|%\([^)]*\)s)$''',
 ]
+# Code, only when the value is unquoted (a quoted value is a real string, always redacted).
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''(?i)[:=][ \t]{0,3}([a-z_][a-z_.]*(\([^()"']*\)[);,]*|[);,]+)|\$[0-9]+)[\r\n]?$''']
 
 # --- Fayda national ID numbers (personal data) -------------------------------------
 # Matched only as stand-alone numbers: not when attached to letters, dots or hyphens, so
