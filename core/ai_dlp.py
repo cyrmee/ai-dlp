@@ -924,14 +924,17 @@ _FALLBACK_RULES = [(rule, re.compile(rx), group) for rule, rx, group in [
     ("gcp-api-key", r"\bAIza[0-9A-Za-z_\-]{35}\b", 0),
     ("stripe-access-token", r"\b(?:sk|rk)_live_[0-9A-Za-z]{20,}\b", 0),
     ("jwt", r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", 0),
-    ("url-password", r"(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@\"'\\]{1,64}:([^\s@/\"'\\$<>{}]{3,128})@", 1),
-    ("password-assignment", r"(?i)(?:password|passwd|pwd|secret)[\"']?[ \t]{0,3}[:=][ \t]{0,3}[\"']?([^\s\"'$\{\(\);,]{4,200})", 1),
+    ("url-password", r"(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@\"'\\]{1,64}:([^\s@/\"'\\<>{}]{3,128})@", 1),
+    ("password-assignment", r"(?i)(?:password|passwd|pwd|secret)[\"']?[ \t]{0,3}[:=][ \t]{0,3}"
+                            r"(?:\"([^\"\s]{4,200})\"|'([^'\s]{4,200})'|([^\s\"'`]{4,200})(?=[\r\n]|$))", None),
     ("fayda-regid", r"(?<![0-9A-Za-z_.\-])([0-9]{29})(?![0-9A-Za-z_\-]|\.[0-9])", 1),
     ("fayda-fan-vid", r"(?<![0-9A-Za-z_.\-])([0-9]{16}|[0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4})(?![0-9A-Za-z_\-]|\.[0-9])", 1),
     ("fayda-fin-uin", r"(?<![0-9A-Za-z_.\-])([0-9]{12}|[0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4})(?![0-9A-Za-z_\-]|\.[0-9])", 1),
 ]]
 _FALLBACK_PLACEHOLDERS = re.compile(r"(?i)^(null|none|true|false|password|secret|changeme|example|x+|\*+|<[^>]*>|\[REDACTED:[^\]]*\]"
                                     r"|9007199254740991|9007199254740992|4503599627370496)$")
+# Variable references, templates and code, as in gitleaks.toml's password-assignment allowlist.
+_FALLBACK_CODE = re.compile(r"(?i)^(\$\{[^}]*\}|\$\([^)]*\)|\$[a-z_][a-z0-9_]*|\$[0-9]+|\{\{.*\}\}|%\([^)]*\)s|[a-z_][a-z0-9_.]*(\([^()]*\)[);,]*|[);,]+))$")
 
 
 def fallback_scan(texts: list[str]) -> list[tuple[str, str]]:
@@ -939,8 +942,10 @@ def fallback_scan(texts: list[str]) -> list[tuple[str, str]]:
     for text in texts:
         for rule, rx, group in _FALLBACK_RULES:
             for m in rx.finditer(text):
-                secret = m.group(group)
-                if secret and not _FALLBACK_PLACEHOLDERS.match(secret):
+                # group None: the first alternative that matched (quoted or not)
+                secret = m.group(group) if group is not None else next((g for g in m.groups() if g), None)
+                if secret and not _FALLBACK_PLACEHOLDERS.match(secret) \
+                        and not (rule in ("password-assignment", "url-password") and _FALLBACK_CODE.match(secret)):
                     found.add((rule, secret))
     return sorted(found, key=lambda rs: len(rs[1]), reverse=True)
 

@@ -9,30 +9,35 @@ title = "ai-dlp"
 useDefault = true
 
 # scheme://user:PASSWORD@host  (e.g. postgres://app:<password>@db:5432/app)
-# Placeholders such as ${DB_PASS}, <password>, password, secret, changeme or **** (as in
+# Placeholders such as $DB_PASS, ${DB_PASS}, <password>, password, secret, changeme or **** (as in
 # READMEs, .env.example and docker-compose files) are not matched.
 [[rules]]
 id = "url-password"
 description = "Password embedded in a connection URL"
-regex = '''(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@"'\\]{1,64}:([^\s@/"'\\$<>{}]{3,128})@'''
+regex = '''(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@"'\\]{1,64}:([^\s@/"'\\<>{}]{3,128})@'''
 secretGroup = 1
 keywords = ["://"]
 [[rules.allowlists]]
 regexTarget = "secret"
-regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+)$''']
+regexes = ['''(?i)^(password|passwd|pass|pwd|secret|changeme|change_me|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|\$[a-z_][a-z0-9_]*)$''']
 
 # password = "<value>", DB_PASSWORD=<value>, secret: <value>, client_secret: <value>
-# Values of 4+ characters: quoted, or unquoted at the end of a line. ${VAR} references,
-# code such as `password = request.getPassword();` and placeholders such as null,
-# none, true, changeme, **** or <value> are not matched.
+# Values of 4+ characters: quoted, or unquoted at the end of a line. Any character may
+# be part of a password (`:_)$;,(` included). Not matched: variable references such as
+# ${DB_PASS}, $DB_PASS or $(cat file), templates such as {{ x }} or %(x)s, code such as
+# `password = getPassword();`, `this.password = password;` or `password: string,`, and
+# placeholders such as null, none, true, changeme, **** or <value>.
 [[rules]]
 id = "password-assignment"
 description = "Password or secret assigned in config, env or code"
-regex = '''(?i)(?:password|passwd|pwd|secret)["']?[ \t]{0,3}[:=][ \t]{0,3}(?:"([^"\s$]{4,200})"|'([^'\s$]{4,200})'|([^\s"'$\{\(\);,]{4,200})(?:[\r\n]|$))'''
+regex = '''(?i)(?:password|passwd|pwd|secret)["']?[ \t]{0,3}[:=][ \t]{0,3}(?:"([^"\s]{4,200})"|'([^'\s]{4,200})'|([^\s"'`]{4,200})(?:[\r\n]|$))'''
 keywords = ["password", "passwd", "pwd", "secret"]
 [[rules.allowlists]]
 regexTarget = "secret"
-regexes = ['''(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|<[^>]*>)$''']
+regexes = [
+  '''(?i)^(null|none|nil|true|false|undefined|empty|string|required|optional|changeme|change_me|password|passwd|secret|example|placeholder|redacted|(your|my)[_-]?(password|passwd|pass|secret|token|key|api[_-]?key|value)|x+|\*+|\.+|<[^>]*>)$''',
+  '''(?i)^(\$\{[^}]*\}|\$\([^)]*\)|\$[a-z_][a-z0-9_]*|\$[0-9]+|\{\{.*\}\}|%\([^)]*\)s|[a-z_][a-z0-9_.]*(\([^()]*\)[);,]*|[);,]+))$''',
+]
 
 # --- Fayda national ID numbers (personal data) -------------------------------------
 # Matched only as stand-alone numbers: not when attached to letters, dots or hyphens, so

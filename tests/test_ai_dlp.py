@@ -111,6 +111,35 @@ class RedactTests(unittest.TestCase):
             self.assertNotIn(v.encode(), out, template)
             self.assertEqual(counts["password-assignment"], 1, template)
 
+    def test_passwords_with_punctuation_are_caught(self):
+        # A password holding ) or $ used to slip past the rule entirely (seen in the wild).
+        for template, value in (("db_host=10.0.0.5\ndb_password=:_)47k2", ":_)47k2"),
+                                ('DB_PASSWORD="pa$$w0rd"', "pa$$w0rd"),
+                                ("secret='a;b,c(d)9'", "a;b,c(d)9"),
+                                ("password=x{y}z$1", "x{y}z$1")):
+            out, counts = self.redact(body_of(template))
+            self.assertNotIn(value.encode(), out, template)
+            self.assertEqual(counts["password-assignment"], 1, template)
+        out, counts = self.redact(body_of("DATABASE_URL=postgres://app:pa$$w0rd9@db/app"))
+        self.assertNotIn(b"pa$$w0rd9", out)
+        self.assertEqual(counts["url-password"], 1)
+
+    def test_code_and_variable_references_are_not_passwords(self):
+        for text in ("password = getPassword();", "this.password = password;", "  password: string;",
+                     "  password: String,", "secret: ${DB_SECRET}", "password=$DB_PASS",
+                     "password=$(cat /run/secrets/db)", "password = %(db_pass)s", "connect(user=u, password=None)",
+                     "where password = $1", "password = getenv(DB_PASS)", "DATABASE_URL=postgres://app:$DB_PASS@db/app"):
+            body = body_of(text)
+            out, counts = self.redact(body)
+            self.assertEqual(out, body, text)
+
+    def test_fallback_rules_match_the_gitleaks_rules(self):
+        self.assertEqual(dlp.fallback_scan(["db_password=:_)47k2"]), [("password-assignment", ":_)47k2")])
+        self.assertEqual(dlp.fallback_scan(['DB_PASSWORD="pa$$w0rd"']), [("password-assignment", "pa$$w0rd")])
+        self.assertEqual(dlp.fallback_scan(["postgres://a:pa$$w0rd9@h/x"]), [("url-password", "pa$$w0rd9")])
+        for text in ("password = getPassword();", "secret: ${X}", "password=None)", "postgres://a:$DB_PASS@h/x"):
+            self.assertEqual(dlp.fallback_scan([text]), [], text)
+
     def test_password_placeholders_are_left_alone(self):
         for text in ("password = null", "password: none", "pwd=true", "password=****", 'password="<value>"',
                      "password=[REDACTED:known-secret]", "password=abc"):

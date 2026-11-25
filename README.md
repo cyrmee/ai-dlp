@@ -28,7 +28,7 @@ The core (`core/`) is the same everywhere; CI runs its tests on Linux, macOS and
    Nothing depends on a provider's IP addresses, so a provider moving to new addresses changes nothing. Lookalikes such as `evilanthropic.com` do not match.
 3. **Scanning.** Each inspected request body is checked two ways:
    - against your own **exact secret values**;
-   - with **[gitleaks](https://github.com/gitleaks/gitleaks)**: its full default rule set (about 200 credential formats, with keyword and entropy checks) plus extra rules for passwords in URLs and `password=` lines (values of 4+ characters; placeholders such as `null` or `<value>` are ignored).
+   - with **[gitleaks](https://github.com/gitleaks/gitleaks)**: its full default rule set (about 200 credential formats, with keyword and entropy checks) plus extra rules for passwords in URLs and `password=` lines (values of 4+ characters, any characters including `$ ) ; ,`; variable references such as `${DB_PASS}`, code such as `getPassword();` and placeholders such as `null` or `<value>` are ignored).
 
    **Fayda national ID numbers** are treated as personal data and redacted: registration IDs (RID, 29 digits), FIN/UIN (12 digits) and FAN/VID (16 digits), including in groups of four (`1234 5678 9012`) and as JSON numbers. They are matched only as stand-alone numbers, so UUIDs, timestamps and longer numbers are left alone.
 
