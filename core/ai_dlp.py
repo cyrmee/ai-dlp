@@ -320,6 +320,15 @@ class Gitleaks:
         return sorted(results, key=lambda rs: len(rs[1]), reverse=True)
 
 
+# JSON-schema keywords whose numbers are limits, not data (tool definitions): never
+# scanned or rewritten, so redaction cannot turn a schema's "maximum" into a string.
+_SCHEMA_NUMBER_KEYS = frozenset({
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength",
+    "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains",
+    "maxContains", "default", "const", "enum", "examples",
+})
+
+
 class _Pairs(list):
     """A JSON object as the full list of its (key, value) pairs, duplicates included."""
 
@@ -596,6 +605,12 @@ def _multipart_views(body: bytes, content_type: str) -> list[str]:
     return views
 
 
+def _numbers_only(value) -> bool:
+    if isinstance(value, list):
+        return all(_numbers_only(v) for v in value)
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def json_strings(obj, out: list[str]) -> None:
     """Collect every string in a parsed JSON document (objects as _Pairs).
 
@@ -625,6 +640,8 @@ def json_strings(obj, out: list[str]) -> None:
             if len(key) >= MIN_LEN:
                 out.append(key)
             if payload is not None and key == "data":
+                continue
+            if key in _SCHEMA_NUMBER_KEYS and _numbers_only(value):
                 continue
             json_strings(value, out)
     elif isinstance(obj, list):
@@ -740,6 +757,15 @@ def _inside(spans: list[tuple[int, int]], pos: int) -> bool:
     return k >= 0 and spans[k][0] < pos < spans[k][1]
 
 
+_SCHEMA_KEY_BEFORE = re.compile(rb'"(' + b"|".join(k.encode() for k in sorted(_SCHEMA_NUMBER_KEYS))
+                                + rb')"\s*:\s*(?:\[[^\]"]*)?$')
+
+
+def _schema_limit(body: bytes, pos: int) -> bool:
+    """True if the bare number at pos is the value (or in the array) of a schema keyword."""
+    return _SCHEMA_KEY_BEFORE.search(body[max(0, pos - 200):pos]) is not None
+
+
 def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
     """Replace a stand-alone number. Where it is a bare JSON number ("fin": 123456789012,
     outside any string) the marker is quoted, so the request stays valid JSON; inside a
@@ -749,6 +775,8 @@ def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
 
     def sub(m: re.Match[bytes]) -> bytes:
         bare = spans is not None and not _inside(spans, m.start())
+        if bare and _schema_limit(m.string, m.start()):
+            return m.group(0)  # a JSON-schema limit, not data: leave the number as it is
         return b'"' + mark + b'"' if bare else mark
     total = 0
     for form in forms:

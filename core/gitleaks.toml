@@ -49,6 +49,10 @@ id = "fayda-fan-vid"
 description = "Fayda FAN or VID (16 digits)"
 regex = '''(?:^|[^0-9A-Za-z_.\-])([0-9]{16}|[0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4})(?:$|[^0-9A-Za-z_.\-]|\.(?:$|[^0-9]))'''
 secretGroup = 1
+# Programming constants, not IDs: 2^53 - 1 (JavaScript Number.MAX_SAFE_INTEGER), 2^53, 2^52
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(9007199254740991|9007199254740992|4503599627370496)$''']
 
 [[rules]]
 id = "fayda-fin-uin"

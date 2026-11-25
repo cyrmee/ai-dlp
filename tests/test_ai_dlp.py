@@ -936,6 +936,29 @@ class FaydaIdTests(unittest.TestCase):
         self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin] id 123e4567-e89b-12d3-a456-123456789012")
         self.assertEqual((doc["x"], doc["y"], doc["z"]), (0.123456789012, -123456789012, "[REDACTED:fayda-fin-uin]"))
 
+    def test_tool_schema_limits_are_left_alone(self):
+        schema = {"type": "object", "properties": {
+            "n": {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
+            "fin": {"type": "integer", "maximum": 999999999999, "enum": [123456789012, 210987654321]}}}
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                           "tools": [{"name": "t", "input_schema": schema}]}).encode()
+        out, counts = self.redact(body)
+        self.assertEqual(json.loads(out)["tools"][0]["input_schema"], schema)
+        self.assertFalse(counts)
+
+    def test_max_safe_integer_is_not_an_id_anywhere(self):
+        body = body_of("Number.MAX_SAFE_INTEGER is 9007199254740991")
+        out, counts = self.redact(body)
+        self.assertEqual(out, body)
+
+    def test_id_in_text_does_not_rewrite_a_schema_limit_with_the_same_digits(self):
+        body = json.dumps({"messages": [{"role": "user", "content": [{"type": "text", "text": "fin 123456789012"}]}],
+                           "tools": [{"name": "t", "input_schema": {"type": "integer", "maximum": 123456789012}}]}).encode()
+        out, counts = self.redact(body)
+        doc = json.loads(out)
+        self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin]")
+        self.assertEqual(doc["tools"][0]["input_schema"]["maximum"], 123456789012)
+
     def test_same_digits_inside_a_longer_number_are_untouched(self):
         out, counts = self.redact(body_of("fin 123456789012 and ts 1123456789012"))
         self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin] and ts 1123456789012")
