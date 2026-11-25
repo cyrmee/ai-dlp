@@ -120,6 +120,7 @@ Item {
       reason: bounded(e.reason, 200),
       test: e.test === true,
       id: /^\d{13}-[0-9a-f]{8}$/.test(String(e.id || "")) ? String(e.id) : "",
+      notes: Array.isArray(e.notes) ? e.notes.slice(0, 20).map(function(n) { return bounded(n, 200) }) : [],
       attachments: attachments
     }
   }

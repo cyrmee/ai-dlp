@@ -56,6 +56,7 @@ def clean(event):
         "reason": bounded(event.get("reason"), 200),
         "test": event.get("test") is True,
         "id": event["id"] if isinstance(event.get("id"), str) and REQUEST_ID.match(event["id"]) else "",
+        "notes": [bounded(n, 200) for n in (event.get("notes") or [])[:20] if isinstance(n, str)],
         "attachments": [
             {"kind": bounded(a.get("kind"), 16), "media": bounded(a.get("media"), 80),
              "bytes": max(0, int(a.get("bytes") or 0)), "name": bounded(a.get("name"), 120),

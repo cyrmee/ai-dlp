@@ -392,6 +392,14 @@ def _readable_runs(raw: bytes) -> str:
 
 # Images and PDFs found while parsing a body, for OCR (set by redact()).
 _MEDIA: contextvars.ContextVar[list[bytes] | None] = contextvars.ContextVar("ai_dlp_media", default=None)
+# Notes about the request for the event log (content sent unscanned, files removed, ...).
+_NOTES: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("ai_dlp_notes", default=None)
+
+
+def _note(text: str) -> None:
+    notes = _NOTES.get()
+    if notes is not None and text not in notes and len(notes) < 20:
+        notes.append(text[:200])
 
 OCR_MAX_BYTES = 25_000_000
 OCR_MAX_PAGES = 20          # PDF pages OCR'd per document (text-less pages and pages with images)
@@ -619,8 +627,8 @@ def _bytes_views(raw: bytes, media: str) -> list[str]:
         pass
     if media.startswith(("audio/", "video/")):
         return []
-    raise ScanError(f"binary content ({media or 'unknown type'}) that is not text, an image or a PDF "
-                    "cannot be scanned")
+    _note(f"sent without being scanned: binary content ({media or 'unknown type'})")
+    return []
 
 
 def _multipart_views(body: bytes, content_type: str) -> list[str]:
@@ -629,7 +637,8 @@ def _multipart_views(body: bytes, content_type: str) -> list[str]:
     msg = BytesParser(policy=policy.HTTP).parsebytes(
         b"Content-Type: " + content_type.encode("latin-1", "replace") + b"\r\n\r\n" + body)
     if not msg.is_multipart():
-        raise ScanError("malformed multipart body")
+        _note("malformed multipart body: scanned as plain text")
+        return [body.decode("utf-8", errors="surrogateescape")]
     views = [body.decode("utf-8", errors="surrogateescape")]  # raw view, for rewriting
     for part in msg.walk():
         if part.is_multipart():
@@ -901,67 +910,261 @@ def replace_all(body: bytes, hits: list[tuple[str, str]], counts: Counter) -> by
     return body
 
 
-async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
-                 content_type: str = "", ocr: OCR | None = None) -> tuple[bytes, Counter]:
+# Built-in patterns, used only if gitleaks itself fails, so a request is still redacted
+# rather than blocked or sent unscanned. (rule id, pattern, group holding the secret)
+_FALLBACK_RULES = [(rule, re.compile(rx), group) for rule, rx, group in [
+    ("private-key", r"-----BEGIN[A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]{0,20000}?-----END[A-Z0-9 ]{0,40}PRIVATE KEY-----", 0),
+    ("anthropic-api-key", r"sk-ant-[A-Za-z0-9]{2,12}-[A-Za-z0-9_\-]{30,}", 0),
+    ("openai-api-key", r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{30,}", 0),
+    ("aws-access-token", r"\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b", 0),
+    ("github-pat", r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b", 0),
+    ("github-fine-grained-pat", r"\bgithub_pat_[A-Za-z0-9_]{50,255}\b", 0),
+    ("gitlab-pat", r"\bglpat-[A-Za-z0-9_\-]{20,}\b", 0),
+    ("slack-token", r"\bxox[abposr]-[A-Za-z0-9\-]{10,}", 0),
+    ("gcp-api-key", r"\bAIza[0-9A-Za-z_\-]{35}\b", 0),
+    ("stripe-access-token", r"\b(?:sk|rk)_live_[0-9A-Za-z]{20,}\b", 0),
+    ("jwt", r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", 0),
+    ("url-password", r"(?i)[a-z][a-z0-9+.\-]{1,20}://[^\s:/@\"'\\]{1,64}:([^\s@/\"'\\$<>{}]{3,128})@", 1),
+    ("password-assignment", r"(?i)(?:password|passwd|pwd|secret)[\"']?[ \t]{0,3}[:=][ \t]{0,3}[\"']?([^\s\"'$\{\(\);,]{4,200})", 1),
+    ("fayda-regid", r"(?<![0-9A-Za-z_.\-])([0-9]{29})(?![0-9A-Za-z_\-]|\.[0-9])", 1),
+    ("fayda-fan-vid", r"(?<![0-9A-Za-z_.\-])([0-9]{16}|[0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4})(?![0-9A-Za-z_\-]|\.[0-9])", 1),
+    ("fayda-fin-uin", r"(?<![0-9A-Za-z_.\-])([0-9]{12}|[0-9]{4}[ \-][0-9]{4}[ \-][0-9]{4})(?![0-9A-Za-z_\-]|\.[0-9])", 1),
+]]
+_FALLBACK_PLACEHOLDERS = re.compile(r"(?i)^(null|none|true|false|password|secret|changeme|example|x+|\*+|<[^>]*>|\[REDACTED:[^\]]*\]"
+                                    r"|9007199254740991|9007199254740992|4503599627370496)$")
+
+
+def fallback_scan(texts: list[str]) -> list[tuple[str, str]]:
+    found = set()
+    for text in texts:
+        for rule, rx, group in _FALLBACK_RULES:
+            for m in rx.finditer(text):
+                secret = m.group(group)
+                if secret and not _FALLBACK_PLACEHOLDERS.match(secret):
+                    found.add((rule, secret))
+    return sorted(found, key=lambda rs: len(rs[1]), reverse=True)
+
+
+def _redact_str(text: str, secrets: list[tuple[str, str]], counts: Counter) -> str:
+    for rule, secret in secrets:
+        mark = placeholder(rule).decode()
+        if _is_number(secret):
+            text, n = _number_rx(secret).subn(mark, text)
+        elif len(secret) >= SHORT_LEN:
+            n = text.count(secret)
+            text = text.replace(secret, mark)
+        else:
+            text, n = _word_rx(secret).subn(mark, text)
+        if n:
+            counts[rule] += n
+    return text
+
+
+def _media_payload(node) -> bytes | None:
+    """The decoded bytes of a {"type": "base64", "data": ...} node, if it is one."""
+    if not isinstance(node, _Pairs):
+        return None
+    d = dict(node)
+    if d.get("type") == "base64" and isinstance(d.get("data"), str) and _is_base64(d["data"]):
+        return base64.b64decode(d["data"])
+    return None
+
+
+def _rebuild_json(obj, secrets, removals: dict, counts: Counter, in_tools=False, top=True, key=None):
+    """A copy of the parsed request with every secret replaced in every string (and ID-shaped
+    JSON number), and every image/document holding a secret replaced by a short note."""
+    if isinstance(obj, str):
+        return _redact_str(obj, secrets, counts)
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        if not (in_tools and key in _SCHEMA_NUMBER_KEYS):
+            for rule, secret in secrets:
+                if _is_number(secret) and secret.replace(" ", "").replace("-", "") == str(obj):
+                    counts[rule] += 1
+                    return placeholder(rule).decode()
+        return obj
+    if isinstance(obj, list) and not isinstance(obj, _Pairs):  # (_Pairs, a JSON object, is a list too)
+        return [_rebuild_json(v, secrets, removals, counts, in_tools, False, key) for v in obj]
+    if isinstance(obj, _Pairs):
+        d = dict(obj) if len({k for k, _ in obj}) == len(obj) else {}
+        source = d.get("source")
+        raw = _media_payload(source) if d.get("type") in ("image", "document") else _media_payload(obj)
+        if raw is not None:
+            rules = removals.get(hashlib.sha256(raw).digest())
+            if not rules:
+                text = raw.decode("utf-8", errors="ignore")
+                rules = {r for r, sec in secrets if contains_secret(text, sec)}
+            if rules:
+                kind = "image" if raw[:16] and not raw.startswith(b"%PDF-") and d.get("type") != "document" else "document"
+                note = f"[REDACTED: {kind} removed by ai-dlp, it contained {', '.join(sorted(rules))}]"
+                for r in rules:
+                    counts[r] += 1
+                if d.get("type") in ("image", "document"):  # an API content block: becomes a text block
+                    return {"type": "text", "text": note}
+                return {k: (base64.b64encode(note.encode()).decode() if k == "data" else
+                            ("text/plain" if k == "media_type" else v)) for k, v in obj}
+        out = {}
+        for k, v in obj:
+            out[_redact_str(k, secrets, counts)] = _rebuild_json(v, secrets, removals, counts,
+                                                                in_tools or (top and k == "tools"), False, k)
+        return out
+    return obj
+
+
+def _rebuild_form(body: bytes, secrets, counts: Counter) -> bytes:
+    from urllib.parse import parse_qsl, urlencode
+    pairs = parse_qsl(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    return urlencode([(_redact_str(k, secrets, counts), _redact_str(v, secrets, counts)) for k, v in pairs],
+                     quote_via=quote).encode()
+
+
+def _rebuild_multipart(body: bytes, content_type: str, secrets, removals: dict, counts: Counter) -> bytes:
+    """Replace the content of every part that still holds a secret (an encoded text part, or a
+    file holding one) by a short note; everything else is kept byte for byte."""
+    m = re.search(r'boundary="?([^";]+)"?', content_type, re.I)
+    if not m:
+        return body
+    sep = b"--" + m.group(1).encode()
+    pieces = body.split(sep)
+    for i, piece in enumerate(pieces):
+        head, gap, content = piece.partition(b"\r\n\r\n")
+        if not gap:
+            continue
+        tail = b"\r\n" if content.endswith(b"\r\n") else b""
+        payload = content[:-2] if tail else content
+        b64 = re.search(rb"(?im)^content-transfer-encoding:\s*base64", head) is not None
+        try:
+            data = base64.b64decode(payload) if b64 else payload
+        except ValueError:
+            continue
+        rules = set(removals.get(hashlib.sha256(data).digest(), ()))
+        text = data.decode("utf-8", errors="ignore")
+        rules |= {r for r, sec in secrets if contains_secret(text, sec)}
+        if rules:
+            note = f"[REDACTED: content removed by ai-dlp, it contained {', '.join(sorted(rules))}]".encode()
+            for r in rules:
+                counts[r] += 1
+            pieces[i] = head + gap + (base64.b64encode(note) if b64 else note) + tail
+    return sep.join(pieces)
+
+
+async def redact(body: bytes, known: list[str], gitleaks: Gitleaks, content_type: str = "",
+                 ocr: OCR | None = None, notes: list[str] | None = None) -> tuple[bytes, Counter]:
+    """Redact every secret and ID in a request. Nothing is refused: what cannot be replaced
+    in place is rebuilt (JSON, forms, upload parts), images/PDFs holding a secret are
+    replaced by a short note, and content that cannot be read is sent and noted."""
+    notes = notes if notes is not None else []
+    token_notes = _NOTES.set(notes)
+    try:
+        return await _redact(body, known, gitleaks, content_type, ocr, notes)
+    finally:
+        _NOTES.reset(token_notes)
+
+
+async def _redact(body, known, gitleaks, content_type, ocr, notes):
+    original = body
     counts: Counter = Counter()
-    body = replace_all(body, [("known-secret", s) for s in known if any(f in body for f in encodings(s))], counts)
+    known_hits = [("known-secret", s) for s in known]
+    body = replace_all(body, [h for h in known_hits if any(f in body for f in encodings(h[1]))], counts)
     media: list[bytes] = []
     token = _MEDIA.set(media)
     try:
-        texts = texts_of(body, content_type)
+        texts = texts_of(original, content_type)
     finally:
         _MEDIA.reset(token)
-    # Text read from images and PDFs. A secret found there cannot be blacked out inside
-    # the file, so it blocks the request (below).
-    ocr_texts = []
+
+    # Text inside images and PDFs (OCR). Limits and tool failures are noted, never refused.
+    media_text: dict[bytes, str] = {}
     if ocr is not None and ocr.available and media:
-        new = sum(1 for raw in media if not ocr.cached(raw))
-        if new > OCR_MAX_ITEMS:
-            raise ScanError(f"{new} new images/PDFs in one request; at most {OCR_MAX_ITEMS} are checked at a time")
+        todo = [raw for raw in media if ocr.cached(raw)]
+        new = [raw for raw in media if not ocr.cached(raw)]
+        if len(new) > OCR_MAX_ITEMS:
+            _note(f"{len(new) - OCR_MAX_ITEMS} images/PDFs sent without OCR (limit {OCR_MAX_ITEMS} per request)")
+            new = new[:OCR_MAX_ITEMS]
 
         async def read_all():
-            for raw in media:
-                text = await ocr.text_of(raw)
+            for raw in todo + new:
+                try:
+                    text = await ocr.text_of(raw)
+                except ScanError as e:
+                    _note(f"image/PDF sent without OCR: {e}")
+                    continue
                 if text:
-                    ocr_texts.append(text)
+                    media_text[hashlib.sha256(raw).digest()] = text
         try:
             await asyncio.wait_for(read_all(), OCR_REQUEST_DEADLINE)
         except asyncio.TimeoutError:
-            raise ScanError(f"reading the images/PDFs in this request took over {OCR_REQUEST_DEADLINE} s") from None
-    for secret in known:
-        if any(contains_secret(t, secret) for t in ocr_texts):
-            raise ScanError("a listed secret appears in the text of an image or PDF")
-        # A known secret can also be spelled in ways the raw replacement cannot see (for
-        # example JSON \u escapes) yet decode to the same text.
-        if any(contains_secret(_without_markers(t, MARKER_LABELS), secret) for t in texts):
-            raise ScanError("a listed secret is present in an encoding that could not be rewritten")
-    scanned = texts + ocr_texts
-    hits = await gitleaks.scan(scanned) if scanned else []
+            _note(f"OCR stopped after {OCR_REQUEST_DEADLINE} s; remaining images/PDFs sent without OCR")
+    readable = {hashlib.sha256(raw).digest(): _readable_runs(raw) for raw in media}
+
+    scanned = texts + list(media_text.values())
+    try:
+        hits = await gitleaks.scan(scanned) if scanned else []
+    except ScanError as e:
+        log.warning("ai-dlp: gitleaks failed (%s); using the built-in rules", e)
+        _note(f"scanned with ai-dlp's built-in rules (gitleaks failed: {str(e)[:80]})")
+        hits = fallback_scan(scanned)
     MARKER_LABELS.update(rule for rule, _ in hits)
     hits = [(rule, secret) for rule, secret in hits if not is_own_marker(secret)]
-    for rule, secret in hits:
-        if any(contains_secret(t, secret) for t in ocr_texts):
-            raise ScanError(f"a secret ({rule}) appears in the text of an image or PDF")
-    was_json = _valid_json(body)
-    body = replace_all(body, hits, counts)
-    if was_json and not _valid_json(body):
+    secrets = sorted(set(known_hits) | set(hits), key=lambda rs: len(rs[1]), reverse=True)
+
+    # Images/PDFs holding a secret are removed (replaced by a note), not sent.
+    removals: dict[bytes, set[str]] = {}
+    for key in set(media_text) | set(readable):
+        views = [media_text.get(key, ""), readable.get(key, "")]
+        rules = {rule for rule, sec in secrets if any(contains_secret(v, sec) for v in views)}
+        if rules:
+            removals[key] = rules
+            _note(f"removed an image/PDF holding {', '.join(sorted(rules))}")
+
+    def remaining(b: bytes) -> list[str]:
+        token = _MEDIA.set(None)
         try:
-            json.loads(body)
-        except ValueError as e:
-            pos = getattr(e, "pos", 0) or 0
-            # Structure only: every letter, digit and non-ASCII byte masked, punctuation kept.
-            near = re.sub(rb"[^\x20-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]", b"x",
-                          body[max(0, pos - 60):pos + 40]).decode("ascii")
-            log.warning("ai-dlp: redaction broke JSON at byte %d of %d (%s); structure near it: %r",
-                        pos, len(body), getattr(e, "msg", type(e).__name__), near)
-        raise ScanError("redaction would have produced invalid JSON")
-    if hits:
-        # A finding that is still present (in an encoding we did not rewrite) must not leave.
-        remaining = [_without_markers(t, MARKER_LABELS) for t in texts_of(body, content_type)]
-        for rule, secret in hits:
-            if any(contains_secret(t, secret) for t in remaining):
-                raise ScanError(f"finding '{rule}' could not be rewritten in the raw body")
-    return body, counts
+            views = [_without_markers(t, MARKER_LABELS) for t in texts_of(b, content_type)]
+        finally:
+            _MEDIA.reset(token)
+        return [rule for rule, sec in secrets if any(contains_secret(v, sec) for v in views)]
+
+    # Fast path: replace in place (keeps the request byte-for-byte otherwise).
+    if not removals:
+        fast = replace_all(body, hits, counts)
+        if (not _valid_json(original) or _valid_json(fast)) and not remaining(fast):
+            return fast, counts
+
+    # Otherwise rebuild the request from its decoded form, so nothing is left behind.
+    counts = Counter()
+    ctype = (content_type or "").lower()
+    if _valid_json(original):
+        doc = json.loads(original, object_pairs_hook=_Pairs)
+        rebuilt = json.dumps(_rebuild_json(doc, secrets, removals, counts), ensure_ascii=False,
+                             separators=(",", ":")).encode()
+    elif "x-www-form-urlencoded" in ctype:
+        rebuilt = _rebuild_form(original, secrets, counts)
+    elif ctype.startswith("multipart/"):
+        rebuilt = replace_all(_rebuild_multipart(original, content_type, secrets, removals, counts), secrets, counts)
+    elif removals and _is_image_or_pdf(original[:16]):
+        rules = sorted(set().union(*removals.values()))
+        for r in rules:
+            counts[r] += 1
+        rebuilt = f"[REDACTED: file removed by ai-dlp, it contained {', '.join(rules)}]".encode()
+    else:
+        rebuilt = replace_all(original, secrets, counts)
+    left = remaining(rebuilt)
+    if left:
+        log.warning("ai-dlp: could not remove every finding (%s); sent with the rest redacted", ", ".join(left))
+        _note(f"could not fully redact: {', '.join(sorted(set(left)))}")
+    return rebuilt, counts
+
+
+def _fallback_redact(body: bytes, known: list[str]) -> tuple[bytes, Counter]:
+    """Last resort after an unexpected scanner error: built-in rules on the raw text."""
+    counts: Counter = Counter()
+    try:
+        text = body.decode("utf-8", errors="surrogateescape")
+        secrets = [("known-secret", s) for s in known] + fallback_scan([text])
+        return replace_all(body, secrets, counts), counts
+    except Exception:
+        log.exception("ai-dlp: built-in rules failed too; request sent as is")
+        return body, counts
 
 
 def _summary(counts: Counter) -> str:
@@ -1221,11 +1424,14 @@ def store_request(method: str, host: str, path: str, headers: list[list[str]],
 
 def record_event(action: str, host: str, path: str, method: str = "", size: int = 0,
                  counts: Counter | None = None, reason: str = "", test: bool = False,
-                 attachments: list[dict] | None = None, request_id: str | None = None) -> None:
+                 attachments: list[dict] | None = None, request_id: str | None = None,
+                 notes: list[str] | None = None) -> None:
     event = {"time": int(time.time() * 1000), "action": action, "host": host[:253],
              "method": method[:10], "path": path.split("?")[0][:200], "bytes": size}
     if request_id:
         event["id"] = request_id
+    if notes:
+        event["notes"] = [n[:200] for n in notes[:20]]
     if counts:
         event["rules"] = dict(counts)
     if reason:
@@ -1341,25 +1547,28 @@ class AiDLP:
         if not self._inspected(flow):
             return
         where = f"{req.pretty_host} {req.path.split('?')[0]}"
+        notes: list[str] = []
         try:
             content = req.get_content(strict=True) or b""
         except ValueError:
-            log.warning("ai-dlp: BLOCKED %s: undecodable content-encoding", where)
-            self._block(flow, "request body could not be decoded for inspection")
+            log.warning("ai-dlp: %s: undecodable content-encoding; sent without being scanned", where)
+            record_event("allowed", req.pretty_host, req.path, req.method,
+                         reason="sent without being scanned: undecodable content-encoding")
             return
         try:
             cleaned, counts = await redact(content, self.secrets.current(), self.gitleaks,
-                                           req.headers.get("content-type", ""), self.ocr)
-        except Exception as e:  # fail closed: never forward an unscanned body
-            if isinstance(e, ScanError):
-                log.warning("ai-dlp: BLOCKED %s: %s", where, e)
-            else:
-                log.exception("ai-dlp: BLOCKED %s: internal scanner error (%s)", where, type(e).__name__)
-            self._block(flow, str(e) if isinstance(e, ScanError) else "internal scanner error")
-            return
-        if counts:
+                                           req.headers.get("content-type", ""), self.ocr, notes)
+        except Exception as e:
+            # Never refuse a request: on an unexpected error, redact with the built-in rules.
+            log.exception("ai-dlp: %s: scanner error (%s); redacted with the built-in rules", where, type(e).__name__)
+            notes.append(f"scanner error ({type(e).__name__}): redacted with ai-dlp's built-in rules only")
+            cleaned, counts = _fallback_redact(content, self.secrets.current())
+        if cleaned != content:
             req.set_content(cleaned)
+        if counts:
             log.warning("ai-dlp: redacted %s in %s", _summary(counts), where)
+        for n in notes:
+            log.warning("ai-dlp: %s: %s", where, n)
         echo = req.headers.get(ECHO_HEADER) == "1"
         try:
             attachments = self.attachments.find(content, req.headers.get("content-type", ""))
@@ -1378,7 +1587,8 @@ class AiDLP:
             except Exception as e:
                 log.warning("ai-dlp: could not store request details: %s", e)
         record_event("redacted" if counts else "allowed", req.pretty_host, req.path, req.method,
-                     len(content), counts, test=echo, attachments=attachments, request_id=rid)
+                     len(content), counts, test=echo, attachments=attachments, request_id=rid,
+                     notes=notes)
         if echo:
             flow.response = http.Response.make(200, cleaned, {"content-type": "application/octet-stream"})
 
@@ -1401,12 +1611,10 @@ class AiDLP:
             # Binary frames (e.g. voice audio) are treated like audio: flagged, not blocked.
             kind = "text/plain" if getattr(msg, "is_text", True) else "audio/x-websocket-binary"
             cleaned, counts = await redact(msg.content, self.secrets.current(), self.gitleaks, kind, self.ocr)
-        except Exception as e:
-            log.warning("ai-dlp: dropped websocket message to %s: %s", flow.request.pretty_host, e)
-            msg.drop()
-            record_event("blocked", flow.request.pretty_host, flow.request.path, "WS",
-                         reason=str(e) if isinstance(e, ScanError) else "internal scanner error")
-            return
+        except Exception:
+            # Never drop a message: on an unexpected error, redact with the built-in rules.
+            log.exception("ai-dlp: websocket scanner error; redacted with the built-in rules")
+            cleaned, counts = _fallback_redact(msg.content, self.secrets.current())
         if counts:
             msg.content = cleaned
             log.warning("ai-dlp: redacted %s in websocket %s", _summary(counts), flow.request.pretty_host)

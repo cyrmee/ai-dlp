@@ -34,12 +34,12 @@ The core (`core/`) is the same everywhere; CI runs its tests on Linux, macOS and
 
    Listed values shorter than 8 characters only match as whole words, so a short password does not redact every word containing it.
 
-   **Images and PDFs** are read too. On Linux, OCR is done with [tesseract](https://github.com/tesseract-ocr/tesseract), PDFs' text layers with poppler, and scanned PDF pages with OCR. Elsewhere, only the readable text inside the file is checked. A secret found inside an image or PDF cannot be blacked out in the file, so that request is blocked. Results are cached, so a resent conversation is not OCR'd again.
+   **Images and PDFs** are read too. On Linux, OCR is done with [tesseract](https://github.com/tesseract-ocr/tesseract), PDFs' text layers with poppler, and scanned PDF pages with OCR. Elsewhere, only the readable text inside the file is checked. A secret found inside an image or PDF cannot be blacked out in the file, so the file is removed from the request and replaced by a short note. Results are cached, so a resent conversation is not OCR'd again.
 
    JSON bodies are parsed and each string is scanned separately. Results are cached, so conversation history an agent resends every turn is not scanned again.
 4. **Redaction.** Each match is replaced with `[REDACTED:<rule-id>]` and the request continues.
-5. **Fail closed.** If a body cannot be scanned reliably (scanner error, undecodable encoding, a finding that cannot be located), the request is blocked with a clear error instead of being sent.
-6. **Attachments.** Each image or PDF is recorded the first time it is sent, with its type, size and name. Other binary uploads that cannot be read (zip, docx and the like) are blocked; audio and video are allowed and flagged.
+5. **Nothing is blocked.** If a secret cannot be replaced in place, the request is rebuilt (JSON re-encoded, forms re-encoded, upload parts replaced) with it redacted. If gitleaks fails, ai-dlp's built-in patterns redact the request instead.
+6. **Attachments.** An image or PDF that holds a secret or ID (found by OCR or in its text) is replaced by a short note, and the rest of the request is sent. Files ai-dlp cannot read (zip, docx and the like, or images and PDFs over the OCR limits) are sent unchanged and marked in the widget as sent without being scanned. Each image or PDF is recorded the first time it is sent.
 7. **Event log.** `events.jsonl` gets one line per inspected request: outcome, host, path, rule names and attachments. It never contains secret values.
 
 ### The certificate authority
@@ -135,19 +135,19 @@ This means Google traffic (Gmail, Drive, YouTube) is decrypted inside the proxy,
   - random fake keys sent through the proxy come back redacted (answered locally, never sent);
   - an unlisted site keeps its real certificate;
   - with `--claude`, a new Claude Code session connects.
-- `ai-dlp log`: redaction, block and attachment events.
+- `ai-dlp log`: redaction and attachment events, and notes such as files removed or sent unscanned.
 - `ai-dlp add-secrets FILE...`: add your own secret values to the exact-match list.
   - Accepts `.env` files, `--pgpass FILE`, or values piped on stdin.
   - On Linux, `--pass` also reads your `pass` store.
 
 ## Omarchy bar widget (Linux)
 
-`omarchy/ai-dlp.widget` is a bar widget for [Omarchy](https://omarchy.org). Its shield shows the state, lights up on redactions, blocks and attachments, and opens a panel with today's counts, a live request list and an on/off switch. See [omarchy/README.md](omarchy/README.md).
+`omarchy/ai-dlp.widget` is a bar widget for [Omarchy](https://omarchy.org). Its shield shows the state, lights up on redactions and attachments, and opens a panel with today's counts, a live request list and an on/off switch. See [omarchy/README.md](omarchy/README.md).
 
 ## Limits
 
 - **Pattern-based detection.** Unusual passwords, secrets that are encoded, split or disguised, and values not on your list can get through. Treat ai-dlp as a safety net behind keeping secrets out of an agent's reach (sandboxes, read-deny rules), not as a replacement.
-- **Images and PDFs:** OCR (Linux) reads printed and screenshot text well, but handwriting, tiny or distorted text, and text in other scripts can be missed. Scanned PDFs are OCR'd up to 20 text-less pages; longer ones are blocked.
+- **Images and PDFs:** OCR (Linux) reads printed and screenshot text well, but handwriting, tiny or distorted text, and text in other scripts can be missed. Scanned PDFs are OCR'd up to 20 pages; beyond that they are sent unscanned (noted in the widget).
 - **The domain name must be visible, or the address known.**
   - Connections without a name, or with Encrypted Client Hello, are forced through inspection when they go to an address a listed service uses; the proxy learns these from DNS and from its own connections.
   - A client that deliberately sends a different, unlisted name to a shared CDN address (domain fronting) is not caught. That is deliberate evasion, which ai-dlp does not try to stop.

@@ -65,15 +65,13 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(counts["known-secret"], 1)
         json.loads(out)  # still valid JSON
 
-    def test_known_secret_hidden_by_json_unicode_escapes_is_blocked(self):
+    def test_known_secret_hidden_by_json_unicode_escapes_is_redacted(self):
         secret = "s3cretValue" + rnd(10)
         SECRETS.write_text(secret + "\n")
         escaped = "".join(f"\\u{ord(c):04x}" for c in secret)  # decodes to the secret
         body = ('{"messages":[{"role":"user","content":"token ' + escaped + '"}]}').encode()
-        self.assertNotIn(secret.encode(), body)
-        self.assertEqual(json.loads(body)["messages"][0]["content"], "token " + secret)
-        with self.assertRaises(dlp.ScanError):
-            self.redact(body)
+        out, counts = self.redact(body)
+        self.assertEqual(json.loads(out)["messages"][0]["content"], "token [REDACTED:known-secret]")
 
     def test_gitleaks_rules_fire_and_body_stays_valid_json(self):
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
@@ -139,8 +137,8 @@ class RedactTests(unittest.TestCase):
         SECRETS.write_text("Zebra7731\n")
         hidden = "".join(f"\\u{ord(c):04x}" for c in "Zebra7731")  # decodes to the secret
         body = ('{"messages":[{"role":"user","content":"x [REDACTED:' + hidden + '] y"}]}').encode()
-        with self.assertRaises(dlp.ScanError):
-            self.redact(body)
+        out, counts = self.redact(body)
+        self.assertNotIn("Zebra7731", json.loads(out)["messages"][0]["content"])
 
     def test_short_password_at_line_start_is_redacted(self):
         SECRETS.write_text("k9x2\n")
@@ -228,24 +226,27 @@ class RedactTests(unittest.TestCase):
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
         data = b64.b64encode(f"not a png at all, key {aws}".encode()).decode()
         body = json.dumps({"x": {"type": "base64", "media_type": "image/png", "data": data}}).encode()
-        with self.assertRaises(dlp.ScanError):  # found in decoded text, cannot be rewritten
-            self.redact(body)
+        out, counts = self.redact(body)
+        self.assertNotIn(aws.encode(), b64.b64decode(json.loads(out)["x"]["data"]))
 
-    def test_unscannable_binary_payload_is_blocked(self):
+    def test_unscannable_binary_payload_is_sent_and_noted(self):
         import base64 as b64
         data = b64.b64encode(b"\x00\xff\xfe" + os.urandom(200)).decode()
         body = json.dumps({"x": {"type": "base64", "media_type": "application/octet-stream", "data": data}}).encode()
-        with self.assertRaises(dlp.ScanError):
-            self.redact(body)
+        notes = []
+        out, counts = run(dlp.redact(body, [], self.gl, "", None, notes))
+        self.assertEqual(out, body)
+        self.assertTrue(any("without being scanned" in n for n in notes))
 
-    def test_secret_appended_to_a_real_png_is_caught(self):
+    def test_secret_appended_to_a_real_png_removes_it(self):
         import base64 as b64
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
         png = b"\x89PNG\r\n\x1a\n" + os.urandom(120) + f" key {aws} ".encode() + os.urandom(40)
         body = json.dumps({"messages": [{"role": "user", "content": [{"type": "image", "source": {
             "type": "base64", "media_type": "image/png", "data": b64.b64encode(png).decode()}}]}]}).encode()
-        with self.assertRaises(dlp.ScanError):
-            self.redact(body)
+        out, counts = self.redact(body)
+        self.assertEqual(json.loads(out)["messages"][0]["content"][0]["type"], "text")
+        self.assertNotIn(b64.b64encode(png), out)
 
     def _multipart(self, *parts):
         b = b""
@@ -263,34 +264,41 @@ class RedactTests(unittest.TestCase):
         out, counts = self.redact_ct(body, "multipart/form-data; boundary=XyZ")
         self.assertNotIn(aws.encode(), out)
 
-    def test_multipart_base64_part_with_secret_is_blocked(self):
+    def test_multipart_base64_part_with_secret_is_replaced(self):
         import base64 as b64
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
         body = self._multipart((b'Content-Disposition: form-data; name="f"\r\nContent-Type: text/plain\r\n'
                                 b"Content-Transfer-Encoding: base64", b64.b64encode(f"key {aws}".encode())))
-        with self.assertRaises(dlp.ScanError):
-            self.redact_ct(body, "multipart/form-data; boundary=XyZ")
+        out, counts = self.redact_ct(body, "multipart/form-data; boundary=XyZ")
+        self.assertNotIn(b64.b64encode(f"key {aws}".encode()), out)
+        self.assertIn(b64.b64encode(b"[REDACTED: content removed by ai-dlp, it contained aws-access-token]"), out)
 
-    def test_multipart_unscannable_binary_part_is_blocked(self):
+    def test_multipart_unscannable_binary_part_is_sent_and_noted(self):
         body = self._multipart((b'Content-Disposition: form-data; name="f"; filename="x.zip"\r\n'
                                 b"Content-Type: application/zip", b"PK\x03\x04\x00\xff\xfe" + os.urandom(64)))
-        with self.assertRaises(dlp.ScanError):
-            self.redact_ct(body, "multipart/form-data; boundary=XyZ")
+        notes = []
+        out, counts = run(dlp.redact(body, [], self.gl, "multipart/form-data; boundary=XyZ", None, notes))
+        self.assertEqual(out, body)
+        self.assertTrue(any("application/zip" in n for n in notes))
 
     def test_audio_body_is_allowed(self):
         audio = b"\x1aE\xdf\xa3" + os.urandom(200)  # WebM/Matroska header + data
         out, counts = self.redact_ct(audio, "audio/webm")
         self.assertEqual(out, audio)
 
-    def test_binary_body_of_unknown_type_is_blocked(self):
-        with self.assertRaises(dlp.ScanError):
-            self.redact_ct(b"\x00\xff\xfe" + os.urandom(100), "application/octet-stream")
+    def test_binary_body_of_unknown_type_is_sent_and_noted(self):
+        raw = b"\x00\xff\xfe" + os.urandom(100)
+        notes = []
+        out, counts = run(dlp.redact(raw, self.secrets.current(), self.gl, "application/octet-stream", None, notes))
+        self.assertEqual(out, raw)
+        self.assertTrue(any("without being scanned" in n for n in notes))
 
-    def test_form_encoded_secret_is_caught(self):
+    def test_form_encoded_secret_is_redacted(self):
+        from urllib.parse import parse_qsl
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
         hidden = "".join(f"%{ord(c):02X}" for c in aws)  # fully percent-encoded
-        with self.assertRaises(dlp.ScanError):
-            self.redact(f"note=hello&key={hidden}".encode())
+        out, counts = run(dlp.redact(f"note=hello&key={hidden}".encode(), [], self.gl, "application/x-www-form-urlencoded"))
+        self.assertEqual(dict(parse_qsl(out.decode()))["key"], "[REDACTED:aws-access-token]")
 
     def test_percent_encoded_known_secret_is_redacted(self):
         secret = "my secret/value+" + rnd(8)
@@ -307,14 +315,16 @@ class RedactTests(unittest.TestCase):
         out, counts = self.redact(body)
         self.assertNotIn(aws.encode(), out)
 
-    def test_secret_inside_base64_text_document_is_blocked(self):
+    def test_secret_inside_base64_text_document_removes_it(self):
         import base64 as b64
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
         data = b64.b64encode(f"config\nkey={aws}\n".encode()).decode()
         body = json.dumps({"messages": [{"role": "user", "content": [
             {"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": data}}]}]}).encode()
-        with self.assertRaises(dlp.ScanError):
-            self.redact(body)
+        out, counts = self.redact(body)
+        block = json.loads(out)["messages"][0]["content"][0]
+        self.assertEqual(block["type"], "text")
+        self.assertIn("aws-access-token", block["text"])
 
     def test_every_copy_of_a_duplicated_key_is_scanned(self):
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
@@ -324,9 +334,13 @@ class RedactTests(unittest.TestCase):
         self.assertNotIn(aws.encode(), out)
         self.assertEqual(counts["aws-access-token"], 1)
 
-    def test_gitleaks_failure_fails_closed(self):
-        with self.assertRaises(dlp.ScanError):
-            self.redact(body_of("FORCE_GITLEAKS_ERROR please"))
+    def test_gitleaks_failure_falls_back_to_built_in_rules(self):
+        aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
+        notes = []
+        out, counts = run(dlp.redact(body_of(f"FORCE_GITLEAKS_ERROR key {aws} fin 123456789012"), [], self.gl, "", None, notes))
+        self.assertNotIn(aws.encode(), out)
+        self.assertNotIn(b"123456789012", out)
+        self.assertTrue(any("built-in rules" in n for n in notes))
 
     def test_non_json_body_is_scanned_as_text(self):
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
@@ -386,13 +400,13 @@ class AddonHookTests(unittest.TestCase):
         aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
         run(self.addon.request(self.Flow(self.Req("api.anthropic.com", body_of("plain hello")))))
         run(self.addon.request(self.Flow(self.Req("api.anthropic.com", body_of(f"k={aws}")))))
-        run(self.addon.request(self.Flow(self.Req("claude.ai", body_of("FORCE_GITLEAKS_ERROR")))))
+        run(self.addon.request(self.Flow(self.Req("claude.ai", body_of(f"FORCE_GITLEAKS_ERROR {aws}")))))
         run(self.addon.request(self.Flow(self.Req("example.com", body_of(f"k={aws}")))))
         ev = self.events()
-        self.assertEqual([e["action"] for e in ev], ["allowed", "redacted", "blocked"])
+        self.assertEqual([e["action"] for e in ev], ["allowed", "redacted", "redacted"])
         self.assertEqual(ev[0]["path"], "/v1/messages")  # query string dropped
         self.assertEqual(ev[1]["rules"], {"aws-access-token": 1})
-        self.assertIn("gitleaks exited", ev[2]["reason"])
+        self.assertIn("built-in rules", " ".join(ev[2]["notes"]))
         self.assertNotIn(aws, EVENTS.read_text())
 
     def test_event_log_rotates(self):
@@ -425,12 +439,10 @@ class AddonHookTests(unittest.TestCase):
         run(self.addon.request(flow))
         self.assertEqual(flow.request._body, body)
 
-    def test_scanner_error_blocks_request(self):
+    def test_scanner_error_is_not_blocked(self):
         flow = self.Flow(self.Req("claude.ai", body_of("FORCE_GITLEAKS_ERROR now")))
         run(self.addon.request(flow))
-        status, body, _ = flow.response
-        self.assertEqual(status, 400)
-        self.assertIn(b"ai-dlp blocked", body)
+        self.assertIsNone(flow.response)  # sent on, not refused
 
     def test_echo_header_answers_locally(self):
         flow = self.Flow(self.Req("api.anthropic.com", body_of("hello there"), {"x-ai-dlp-echo": "1"}))
@@ -766,21 +778,30 @@ class OCRTests(unittest.TestCase):
         return json.dumps({"messages": [{"role": "user", "content": [{"type": kind, "source": {
             "type": "base64", "media_type": media, "data": b64.b64encode(raw).decode()}}]}]}).encode()
 
-    def test_secret_in_an_image_is_caught_by_ocr(self):
+    def test_secret_in_an_image_found_by_ocr_removes_the_image(self):
         png = _png_of(_pdf_with_lines("password=Kangaroo42", "nothing else here"))
-        with self.assertRaises(dlp.ScanError) as e:
-            run(dlp.redact(self.block("image", "image/png", png), [], self.gl, "application/json", self.ocr))
-        self.assertIn("image or PDF", str(e.exception))
+        notes = []
+        out, counts = run(dlp.redact(self.block("image", "image/png", png), [], self.gl, "application/json", self.ocr, notes))
+        block = json.loads(out)["messages"][0]["content"][0]
+        self.assertEqual(block, {"type": "text", "text": "[REDACTED: image removed by ai-dlp, it contained password-assignment]"})
+        self.assertEqual(counts["password-assignment"], 1)
+        self.assertTrue(any("removed an image" in n for n in notes))
 
-    def test_secret_in_a_pdf_text_layer_is_caught(self):
+    def test_secret_in_a_pdf_text_layer_removes_the_pdf(self):
         pdf = _pdf_with_lines("config", "password=Kangaroo42")
-        with self.assertRaises(dlp.ScanError):
-            run(dlp.redact(self.block("document", "application/pdf", pdf), [], self.gl, "application/json", self.ocr))
+        out, counts = run(dlp.redact(self.block("document", "application/pdf", pdf), [], self.gl, "application/json", self.ocr))
+        block = json.loads(out)["messages"][0]["content"][0]
+        self.assertEqual(block["type"], "text")
+        self.assertIn("document removed", block["text"])
+        self.assertNotIn(b"Kangaroo42", out)
 
-    def test_listed_secret_in_an_image_is_caught(self):
+    def test_listed_secret_in_an_image_removes_the_image(self):
         png = _png_of(_pdf_with_lines("my pin is Zebra7731"))
-        with self.assertRaises(dlp.ScanError):
-            run(dlp.redact(self.block("image", "image/png", png), ["Zebra7731"], self.gl, "application/json", self.ocr))
+        out, counts = run(dlp.redact(self.block("image", "image/png", png), ["Zebra7731"], self.gl, "application/json", self.ocr))
+        block = json.loads(out)["messages"][0]["content"][0]
+        self.assertEqual(block["type"], "text")
+        self.assertIn("image removed", block["text"])
+        self.assertIn("known-secret", block["text"])
 
     def test_screenshot_inside_a_text_pdf_is_ocrd(self):
         listing = ("page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio\n"
@@ -805,14 +826,14 @@ class OCRTests(unittest.TestCase):
         self.assertGreater(h, 100)
         self.assertEqual(dlp.image_size(b"GIF89a" + (320).to_bytes(2, "little") + (200).to_bytes(2, "little")), (320, 200))
 
-    def test_too_many_new_images_in_one_request_is_blocked(self):
+    def test_too_many_new_images_are_sent_and_noted(self):
         import base64 as b64
         blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
                    "data": b64.b64encode(b"\x89PNG\r\n\x1a\n" + os.urandom(40)).decode()}} for _ in range(dlp.OCR_MAX_ITEMS + 1)]
         body = json.dumps({"messages": [{"role": "user", "content": blocks}]}).encode()
-        with self.assertRaises(dlp.ScanError) as e:
-            run(dlp.redact(body, [], self.gl, "application/json", self.ocr))
-        self.assertIn("at most", str(e.exception))
+        notes = []
+        out, counts = run(dlp.redact(body, [], self.gl, "application/json", self.ocr, notes))
+        self.assertTrue(any("without OCR" in n for n in notes), notes)
 
     def test_page_sizes_use_the_larger_box_and_rotation(self):
         out = ("Pages: 2\n"
@@ -1127,16 +1148,16 @@ class RequestStoreTests(unittest.TestCase):
         self.assertIn("[REDACTED:aws-access-token]", rec["body"])
         self.assertEqual(dict(rec["headers"])["x-api-key"], "[hidden]")
 
-    def test_blocked_request_is_stored_without_its_body(self):
+    def test_request_after_a_scanner_error_is_stored_redacted(self):
         addon = dlp.AiDLP()
         dlp.http = type("http", (), {"Response": AddonHookTests.FakeResponse})
-        req = AddonHookTests.Req("api.anthropic.com", body_of("FORCE_GITLEAKS_ERROR secret stuff"))
+        aws = "AK" + "IA" + rnd(16, string.ascii_uppercase + "234567")
+        req = AddonHookTests.Req("api.anthropic.com", body_of(f"FORCE_GITLEAKS_ERROR {aws}"))
         req.headers.fields = [(b"content-type", b"application/json")]
         run(addon.request(AddonHookTests.Flow(req)))
         ev = json.loads(EVENTS.read_text().splitlines()[-1])
-        self.assertEqual(ev["action"], "blocked")
         rec = json.loads((self.dir / f"{ev['id']}.json").read_text())
-        self.assertIsNone(rec["body"])
+        self.assertNotIn(aws, rec["body"])
 
     def test_other_users_requests_are_not_stored(self):
         dlp.client_uid = lambda flow: 1001

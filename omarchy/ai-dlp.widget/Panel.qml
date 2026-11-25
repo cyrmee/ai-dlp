@@ -681,6 +681,23 @@ Panel {
           elide: Text.ElideRight
         }
 
+        // What ai-dlp did beyond plain redaction: files removed, content sent unscanned, ...
+        Repeater {
+          model: row.entry.notes || []
+          Text {
+            required property var modelData
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            text: "󰋽  " + modelData
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+            maximumLineCount: 2
+            elide: Text.ElideRight
+          }
+        }
+
         // Images and PDFs cannot be scanned for secrets, so each one is listed.
         Repeater {
           model: row.entry.attachments || []
