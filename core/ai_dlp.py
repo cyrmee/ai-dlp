@@ -829,9 +829,11 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
             json.loads(body)
         except ValueError as e:
             pos = getattr(e, "pos", 0) or 0
-            near = re.sub(rb"[0-9]", b"#", body[max(0, pos - 60):pos + 40]).decode("utf-8", "replace")
-            log.warning("ai-dlp: redaction broke JSON at byte %d (%s); near (digits masked): %r",
-                        pos, getattr(e, "msg", e), near)
+            # Structure only: every letter, digit and non-ASCII byte masked, punctuation kept.
+            near = re.sub(rb"[^\x20-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]", b"x",
+                          body[max(0, pos - 60):pos + 40]).decode("ascii")
+            log.warning("ai-dlp: redaction broke JSON at byte %d of %d (%s); structure near it: %r",
+                        pos, len(body), getattr(e, "msg", type(e).__name__), near)
         raise ScanError("redaction would have produced invalid JSON")
     if hits:
         # A finding that is still present (in an encoding we did not rewrite) must not leave.
