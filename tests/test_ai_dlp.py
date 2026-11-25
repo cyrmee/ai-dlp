@@ -920,6 +920,13 @@ class FaydaIdTests(unittest.TestCase):
         self.assertEqual(doc["fin"], "[REDACTED:fayda-fin-uin]")
         self.assertEqual(doc["n"], [1795612345123])
 
+    def test_json_shaped_number_inside_a_string_stays_valid_json(self):
+        # code pasted into a message, e.g. a test fixture: {"fin":123456789012,"n":1}
+        body = json.dumps({"messages": [{"role": "user", "content": [{"type": "text",
+                           "text": 'fixture {"fin":123456789012,"n":[1]} end'}]}]}).encode()
+        out, counts = self.redact(body)
+        self.assertEqual(self.text_of(out), 'fixture {"fin":[REDACTED:fayda-fin-uin],"n":[1]} end')
+
     def test_same_digits_inside_a_longer_number_are_untouched(self):
         out, counts = self.redact(body_of("fin 123456789012 and ts 1123456789012"))
         self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin] and ts 1123456789012")

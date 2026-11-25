@@ -708,18 +708,48 @@ def contains_secret(text: str, secret: str) -> bool:
     return _word_rx(secret).search(text) is not None
 
 
+def _valid_json(body: bytes) -> bool:
+    try:
+        json.loads(body)
+        return True
+    except ValueError:
+        return False
+
+
+def _json_string_spans(body: bytes) -> list[tuple[int, int]] | None:
+    """(start, end) of every string literal in a JSON body, or None if it is not JSON."""
+    if body.lstrip()[:1] not in (b"{", b"["):
+        return None
+    spans, i, n = [], 0, len(body)
+    while i < n:
+        if body[i] == 0x22:  # "
+            start, i = i, i + 1
+            while i < n and body[i] != 0x22:
+                i += 2 if body[i] == 0x5C else 1  # skip escaped characters
+            spans.append((start, i))
+        i += 1
+    return spans
+
+
+def _inside(spans: list[tuple[int, int]], pos: int) -> bool:
+    import bisect
+    k = bisect.bisect_right(spans, (pos, float("inf"))) - 1
+    return k >= 0 and spans[k][0] < pos < spans[k][1]
+
+
 def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
-    """Replace a stand-alone number. Where it is a bare JSON number ("fin": 123456789012)
-    the marker is quoted, so the request stays valid JSON."""
+    """Replace a stand-alone number. Where it is a bare JSON number ("fin": 123456789012,
+    outside any string) the marker is quoted, so the request stays valid JSON; inside a
+    string it is replaced as text."""
     forms = {secret.encode(), quote(secret, safe="").encode(), quote_plus(secret, safe="").encode()}
+    spans = None
 
     def sub(m: re.Match[bytes]) -> bytes:
-        before = m.string[:m.start()].rstrip()
-        after = m.string[m.end():].lstrip()
-        bare = before[-1:] in (b":", b"[", b",") and after[:1] in (b",", b"}", b"]")
+        bare = spans is not None and not _inside(spans, m.start())
         return b'"' + mark + b'"' if bare else mark
     total = 0
     for form in forms:
+        spans = _json_string_spans(body)
         body, n = _number_rx(form).subn(sub, body)
         total += n
     return body, total
@@ -789,7 +819,10 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
     for rule, secret in hits:
         if any(contains_secret(t, secret) for t in ocr_texts):
             raise ScanError(f"a secret ({rule}) appears in the text of an image or PDF")
+    was_json = _valid_json(body)
     body = replace_all(body, hits, counts)
+    if was_json and not _valid_json(body):
+        raise ScanError("redaction would have produced invalid JSON")
     if hits:
         # A finding that is still present (in an encoding we did not rewrite) must not leave.
         remaining = [_without_markers(t, MARKER_LABELS) for t in texts_of(body, content_type)]
