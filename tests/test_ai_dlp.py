@@ -939,12 +939,31 @@ class FaydaIdTests(unittest.TestCase):
     def test_tool_schema_limits_are_left_alone(self):
         schema = {"type": "object", "properties": {
             "n": {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
-            "fin": {"type": "integer", "maximum": 999999999999, "enum": [123456789012, 210987654321]}}}
+            "fin": {"type": "integer", "maximum": 999999999999, "exclusiveMinimum": 100000000000}}}
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
                            "tools": [{"name": "t", "input_schema": schema}]}).encode()
         out, counts = self.redact(body)
         self.assertEqual(json.loads(out)["tools"][0]["input_schema"], schema)
         self.assertFalse(counts)
+
+    def test_schema_exemption_is_only_for_limits_in_tool_definitions(self):
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                           "metadata": {"maximum": 123456789012},            # not in tools
+                           "tools": [{"name": "t", "input_schema": {"type": "integer",
+                                      "default": 210987654321, "enum": [111122223333],
+                                      "maximum": 123456789012}}]}).encode()
+        out, counts = self.redact(body)
+        doc = json.loads(out)
+        self.assertEqual(doc["metadata"]["maximum"], "[REDACTED:fayda-fin-uin]")
+        schema = doc["tools"][0]["input_schema"]
+        self.assertEqual(schema["default"], "[REDACTED:fayda-fin-uin]")       # data keyword: scanned
+        self.assertEqual(schema["enum"], ["[REDACTED:fayda-fin-uin]"])
+        self.assertEqual(schema["maximum"], 123456789012)                     # limit in tools: kept
+
+    def test_tools_span_finds_only_the_top_level_key(self):
+        b = b'{"messages":[{"content":"\\"tools\\": [1]","tools":[2]}],"tools" : [{"a":"]}"}], "z":1}'
+        start, end = dlp._tools_span(b)
+        self.assertEqual(b[start:end], b'[{"a":"]}"}]')
 
     def test_max_safe_integer_is_not_an_id_anywhere(self):
         body = body_of("Number.MAX_SAFE_INTEGER is 9007199254740991")

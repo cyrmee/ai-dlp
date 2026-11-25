@@ -320,12 +320,14 @@ class Gitleaks:
         return sorted(results, key=lambda rs: len(rs[1]), reverse=True)
 
 
-# JSON-schema keywords whose numbers are limits, not data (tool definitions): never
-# scanned or rewritten, so redaction cannot turn a schema's "maximum" into a string.
+# JSON-schema limit keywords. Inside the request's top-level "tools" (tool definitions)
+# their numbers are bounds, not data: not scanned or rewritten, so redaction cannot turn a
+# schema's "maximum" into a string. Everywhere else, and for data keywords such as
+# default/const/enum/examples, numbers are scanned as usual.
 _SCHEMA_NUMBER_KEYS = frozenset({
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength",
     "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains",
-    "maxContains", "default", "const", "enum", "examples",
+    "maxContains",
 })
 
 
@@ -611,7 +613,7 @@ def _numbers_only(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def json_strings(obj, out: list[str]) -> None:
+def json_strings(obj, out: list[str], in_tools: bool = False, top: bool = True) -> None:
     """Collect every string in a parsed JSON document (objects as _Pairs).
 
     Every value of a duplicated key is collected: a server may read a different copy
@@ -641,12 +643,12 @@ def json_strings(obj, out: list[str]) -> None:
                 out.append(key)
             if payload is not None and key == "data":
                 continue
-            if key in _SCHEMA_NUMBER_KEYS and _numbers_only(value):
+            if in_tools and key in _SCHEMA_NUMBER_KEYS and _numbers_only(value):
                 continue
-            json_strings(value, out)
+            json_strings(value, out, in_tools or (top and key == "tools"), False)
     elif isinstance(obj, list):
         for item in obj:
-            json_strings(item, out)
+            json_strings(item, out, in_tools, False)
 
 
 def texts_of(body: bytes, content_type: str = "") -> list[str]:
@@ -758,12 +760,54 @@ def _inside(spans: list[tuple[int, int]], pos: int) -> bool:
 
 
 _SCHEMA_KEY_BEFORE = re.compile(rb'"(' + b"|".join(k.encode() for k in sorted(_SCHEMA_NUMBER_KEYS))
-                                + rb')"\s*:\s*(?:\[[^\]"]*)?$')
+                                + rb')"\s*:\s*$')
 
 
-def _schema_limit(body: bytes, pos: int) -> bool:
-    """True if the bare number at pos is the value (or in the array) of a schema keyword."""
-    return _SCHEMA_KEY_BEFORE.search(body[max(0, pos - 200):pos]) is not None
+def _tools_span(body: bytes) -> tuple[int, int] | None:
+    """Byte range of the value of the top-level "tools" key in a JSON object body."""
+    i, n, depth = 0, len(body), 0
+    while i < n:
+        c = body[i]
+        if c == 0x22:  # string
+            start, i = i, i + 1
+            while i < n and body[i] != 0x22:
+                i += 2 if body[i] == 0x5C else 1
+            if depth == 1 and body[start + 1:i] == b"tools":
+                j = i + 1
+                while j < n and body[j] in b" \t\r\n":
+                    j += 1
+                if j < n and body[j] == 0x3A:  # ':' : this string is the key
+                    j += 1
+                    while j < n and body[j] in b" \t\r\n":
+                        j += 1
+                    k, d = j, 0
+                    while k < n:  # find the end of the value
+                        b = body[k]
+                        if b == 0x22:
+                            k += 1
+                            while k < n and body[k] != 0x22:
+                                k += 2 if body[k] == 0x5C else 1
+                        elif b in b"[{":
+                            d += 1
+                        elif b in b"]}":
+                            d -= 1
+                            if d == 0:
+                                return j, k + 1
+                        k += 1
+                    return None
+        elif c in b"[{":
+            depth += 1
+        elif c in b"]}":
+            depth -= 1
+        i += 1
+    return None
+
+
+def _schema_limit(body: bytes, pos: int, tools: tuple[int, int] | None) -> bool:
+    """True if the bare number at pos is a schema limit inside the top-level "tools"."""
+    if tools is None or not tools[0] <= pos < tools[1]:
+        return False
+    return _SCHEMA_KEY_BEFORE.search(body[max(tools[0], pos - 80):pos]) is not None
 
 
 def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
@@ -771,16 +815,17 @@ def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
     outside any string) the marker is quoted, so the request stays valid JSON; inside a
     string it is replaced as text."""
     forms = {secret.encode(), quote(secret, safe="").encode(), quote_plus(secret, safe="").encode()}
-    spans = None
+    spans = tools = None
 
     def sub(m: re.Match[bytes]) -> bytes:
         bare = spans is not None and not _inside(spans, m.start())
-        if bare and _schema_limit(m.string, m.start()):
+        if bare and _schema_limit(m.string, m.start(), tools):
             return m.group(0)  # a JSON-schema limit, not data: leave the number as it is
         return b'"' + mark + b'"' if bare else mark
     total = 0
     for form in forms:
         spans = _json_string_spans(body)
+        tools = _tools_span(body) if spans is not None else None
         body, n = _number_rx(form).subn(sub, body)
         total += n
     return body, total
