@@ -960,6 +960,18 @@ class FaydaIdTests(unittest.TestCase):
         self.assertEqual(schema["enum"], ["[REDACTED:fayda-fin-uin]"])
         self.assertEqual(schema["maximum"], 123456789012)                     # limit in tools: kept
 
+    def test_scalar_tools_value_gives_no_exemption(self):
+        self.assertIsNone(dlp._tools_span(b'{"tools": 1, "metadata": {"maximum": 123456789012}}'))
+        body = b'{"messages":[{"role":"user","content":"hi"}],"tools":1,"metadata":{"maximum":123456789012}}'
+        out, counts = self.redact(body)
+        self.assertEqual(json.loads(out)["metadata"]["maximum"], "[REDACTED:fayda-fin-uin]")
+
+    def test_unchanged_matches_are_not_counted(self):
+        body = json.dumps({"messages": [{"role": "user", "content": "x"}],
+                           "tools": [{"input_schema": {"maximum": 123456789012}}]}).encode()
+        out, n = dlp._replace_number(body, "123456789012", b"[REDACTED:fayda-fin-uin]")
+        self.assertEqual((out, n), (body, 0))
+
     def test_tools_span_finds_only_the_top_level_key(self):
         b = b'{"messages":[{"content":"\\"tools\\": [1]","tools":[2]}],"tools" : [{"a":"]}"}], "z":1}'
         start, end = dlp._tools_span(b)

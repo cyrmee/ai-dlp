@@ -780,6 +780,8 @@ def _tools_span(body: bytes) -> tuple[int, int] | None:
                     j += 1
                     while j < n and body[j] in b" \t\r\n":
                         j += 1
+                    if j >= n or body[j] not in b"[{":
+                        return None  # only a list or object can hold tool definitions
                     k, d = j, 0
                     while k < n:  # find the end of the value
                         b = body[k]
@@ -826,8 +828,15 @@ def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
     for form in forms:
         spans = _json_string_spans(body)
         tools = _tools_span(body) if spans is not None else None
-        body, n = _number_rx(form).subn(sub, body)
-        total += n
+        changed = 0
+
+        def counted(m: re.Match[bytes]) -> bytes:
+            nonlocal changed
+            new = sub(m)
+            changed += new != m.group(0)
+            return new
+        body = _number_rx(form).sub(counted, body)
+        total += changed
     return body, total
 
 
