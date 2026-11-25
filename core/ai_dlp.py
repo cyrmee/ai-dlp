@@ -78,7 +78,9 @@ SECRETS_FILE = Path(os.environ.get(
 GITLEAKS_CONFIG = Path(os.environ.get("AI_DLP_GITLEAKS_CONFIG", CONFIG_DIR / "gitleaks.toml"))
 # The gitleaks command (a list, so tests can run a script through the interpreter).
 GITLEAKS_CMD = [os.environ.get("AI_DLP_GITLEAKS") or shutil.which("gitleaks") or "gitleaks"]
-GITLEAKS_TIMEOUT = 30
+GITLEAKS_TIMEOUT = 120
+GITLEAKS_CHUNK = 400_000      # characters per gitleaks run; big requests are split and run in parallel
+GITLEAKS_PARALLEL = 4         # gitleaks processes at once, across all requests
 # Shortest secret value that is matched exactly. Values shorter than SHORT_LEN only
 # match as whole words, so a 4-character password does not redact every word that
 # happens to contain it.
@@ -257,6 +259,7 @@ class Gitleaks:
         self.cmd = list(cmd or GITLEAKS_CMD)
         self.config = config or GITLEAKS_CONFIG
         self.cache: OrderedDict[bytes, list[tuple[str, str]]] = OrderedDict()
+        self._limit: asyncio.Semaphore | None = None
         self._config_mtime: float | None = None
 
     def _check_config(self) -> None:
@@ -292,9 +295,12 @@ class Gitleaks:
         """Return the unique (rule id, literal secret text) found across texts."""
         self._check_config()
         keyed = {hashlib.sha256(t.encode("utf-8", errors="surrogateescape")).digest(): t for t in texts}
-        pending = {k: t for k, t in keyed.items() if k not in self.cache}
+        # Results already cached are taken now: the cache can change while this scan waits
+        # (other requests evict entries; a rules change clears it).
+        known = {k: self.cache[k] for k in keyed if k in self.cache}
+        pending = {k: t for k, t in keyed.items() if k not in known}
         if pending:
-            found = await self.run("\n\n".join(pending.values()))
+            found = await self._run_chunked(list(pending.values()))
             per_text: dict[bytes, list[tuple[str, str]]] = {k: [] for k in pending}
             for rule, secret, match in found:
                 located = False
@@ -311,13 +317,38 @@ class Gitleaks:
                     raise ScanError(f"gitleaks finding '{rule}' could not be located (encoded secret?)")
             for k, hits in per_text.items():
                 self.cache[k] = hits
+                known[k] = hits
             while len(self.cache) > CACHE_SIZE:
                 self.cache.popitem(last=False)
         results = set()
         for k in keyed:
-            self.cache.move_to_end(k)
-            results.update(self.cache[k])
+            if k in self.cache:
+                self.cache.move_to_end(k)
+            results.update(known[k])
         return sorted(results, key=lambda rs: len(rs[1]), reverse=True)
+
+    async def _run_chunked(self, texts: list[str]) -> list[tuple[str, str, str]]:
+        """Run gitleaks over texts in chunks of about GITLEAKS_CHUNK characters, several at
+        once (at most GITLEAKS_PARALLEL processes across all requests)."""
+        if self._limit is None:
+            self._limit = asyncio.Semaphore(GITLEAKS_PARALLEL)
+        chunks, cur, size = [], [], 0
+        for t in texts:
+            if cur and size + len(t) > GITLEAKS_CHUNK:
+                chunks.append(cur)
+                cur, size = [], 0
+            cur.append(t)
+            size += len(t) + 2
+        if cur:
+            chunks.append(cur)
+
+        async def one(chunk):
+            async with self._limit:
+                return await self.run("\n\n".join(chunk))
+        found = []
+        for part in await asyncio.gather(*(one(c) for c in chunks)):
+            found += part
+        return found
 
 
 # JSON-schema limit keywords. Inside the request's top-level "tools" (tool definitions)
@@ -673,10 +704,16 @@ def texts_of(body: bytes, content_type: str = "") -> list[str]:
     return out
 
 
+# In a raw JSON body the text "line\n1234" is stored as "line\\n1234": the escape ends in a
+# letter. When rewriting raw bytes, a JSON escape right before a value counts as a boundary,
+# exactly as the newline it stands for does in the decoded text that detection sees.
+_ESCAPE_BEFORE = rb'(?<=\\[ntrbf/"\\])|(?<=\\u[0-9A-Fa-f]{4})'
+
+
 def _word_rx(value: str | bytes):
     """Match value only where it is not part of a longer word (for short secrets)."""
     if isinstance(value, bytes):
-        return re.compile(rb"(?<![A-Za-z0-9])" + re.escape(value) + rb"(?![A-Za-z0-9])")
+        return re.compile(rb"(?:" + _ESCAPE_BEFORE + rb"|(?<![A-Za-z0-9]))" + re.escape(value) + rb"(?![A-Za-z0-9])")
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(value) + r"(?![A-Za-z0-9])")
 
 
@@ -718,7 +755,8 @@ def _number_rx(value):
     not after '.', and not before '.' + digit. So the digits inside a decimal (0.123...),
     a negative number, a UUID or a version are never touched."""
     if isinstance(value, bytes):
-        return re.compile(rb"(?<![0-9A-Za-z_.\-])" + re.escape(value) + rb"(?![0-9A-Za-z_\-]|\.[0-9])")
+        return re.compile(rb"(?:" + _ESCAPE_BEFORE + rb"|(?<![0-9A-Za-z_.\-]))" + re.escape(value)
+                          + rb"(?![0-9A-Za-z_\-]|\.[0-9])")
     return re.compile(r"(?<![0-9A-Za-z_.\-])" + re.escape(value) + r"(?![0-9A-Za-z_\-]|\.[0-9])")
 
 
@@ -1313,7 +1351,10 @@ class AiDLP:
             cleaned, counts = await redact(content, self.secrets.current(), self.gitleaks,
                                            req.headers.get("content-type", ""), self.ocr)
         except Exception as e:  # fail closed: never forward an unscanned body
-            log.warning("ai-dlp: BLOCKED %s: %s", where, e)
+            if isinstance(e, ScanError):
+                log.warning("ai-dlp: BLOCKED %s: %s", where, e)
+            else:
+                log.exception("ai-dlp: BLOCKED %s: internal scanner error (%s)", where, type(e).__name__)
             self._block(flow, str(e) if isinstance(e, ScanError) else "internal scanner error")
             return
         if counts:

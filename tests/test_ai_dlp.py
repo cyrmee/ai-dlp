@@ -142,6 +142,36 @@ class RedactTests(unittest.TestCase):
         with self.assertRaises(dlp.ScanError):
             self.redact(body)
 
+    def test_short_password_at_line_start_is_redacted(self):
+        SECRETS.write_text("k9x2\n")
+        out, counts = self.redact(body_of("pin:\nk9x2\nend"))
+        self.assertNotIn(b"k9x2", out)
+
+    def test_big_scans_are_split_and_still_find_everything(self):
+        saved = dlp.GITLEAKS_CHUNK
+        dlp.GITLEAKS_CHUNK = 50
+        try:
+            akias = ["AK" + "IA" + rnd(16, string.ascii_uppercase + "234567") for _ in range(6)]
+            body = json.dumps({"messages": [{"role": "user", "content": [{"type": "text", "text": f"k {a} " + rnd(40)}
+                               for a in akias]}]}).encode()
+            out, counts = self.redact(body)
+            self.assertEqual(counts["aws-access-token"], 6)
+            for a in akias:
+                self.assertNotIn(a.encode(), out)
+        finally:
+            dlp.GITLEAKS_CHUNK = saved
+
+    def test_cache_cleared_mid_scan_does_not_break_the_scan(self):
+        self.redact(body_of("first message " + rnd(20)))
+        original = self.gl.run
+
+        async def clearing_run(data):
+            self.gl.cache.clear()  # e.g. a rules change during the scan
+            return await original(data)
+        self.gl.run = clearing_run
+        out, counts = self.redact(body_of("first message " + rnd(20), "new text " + rnd(20)))
+        self.assertFalse(counts)
+
     def test_short_listed_secret_matches_whole_words_only(self):
         SECRETS.write_text("k9x2\n")
         out, counts = self.redact(body_of("pin k9x2 here; also k9x2z and ak9x2 stay"))
@@ -989,6 +1019,12 @@ class FaydaIdTests(unittest.TestCase):
         doc = json.loads(out)
         self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin]")
         self.assertEqual(doc["tools"][0]["input_schema"]["maximum"], 123456789012)
+
+    def test_ids_after_json_escapes_are_redacted(self):
+        for text in ("line\n123456789012\nnext", "a\t123456789012", 'say "123456789012"', "nbsp\u00a0123456789012"):
+            out, counts = self.redact(body_of(text))
+            self.assertNotIn(b"123456789012", out, repr(text))
+            self.assertEqual(counts["fayda-fin-uin"], 1, repr(text))
 
     def test_same_digits_inside_a_longer_number_are_untouched(self):
         out, counts = self.redact(body_of("fin 123456789012 and ts 1123456789012"))
