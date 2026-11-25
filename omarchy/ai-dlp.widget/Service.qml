@@ -17,13 +17,12 @@ Item {
   readonly property string controlPath: "/usr/local/bin/ai-dlp"
   readonly property bool showAllowedSetting: setting("showAllowed", true) !== false
   readonly property bool notifyRedacted: setting("notifyRedacted", true) !== false
-  readonly property bool notifyBlocked: setting("notifyBlocked", true) !== false
   readonly property bool notifyAttachments: setting("notifyAttachments", true) !== false
 
   property bool installed: true
   property string proxy: "unknown"
   property string firewall: "unknown"
-  property var counts: ({ allowed: 0, redacted: 0, blocked: 0, attachments: 0 })
+  property var counts: ({ allowed: 0, redacted: 0, attachments: 0 })
   // Newest first: { time, action, host, method, path, bytes, rules, reason, test,
   //                 attachments: [{ kind, media, bytes, name, source }] }.
   property var recent: []
@@ -40,7 +39,7 @@ Item {
   }
   readonly property bool routingOn: firewall === "active"
   readonly property bool busy: toggleProcess.running
-  // "redacted", "blocked" or "attachment" for a few seconds after one happens, for the bar icon.
+  // "redacted" or "attachment" for a few seconds after one happens, for the bar icon.
   property string flash: ""
 
   // The request opened in the detail view: { method, host, path, stored, changes:
@@ -103,7 +102,7 @@ Item {
       var keys = Object.keys(e.rules).slice(0, 20)
       for (var i = 0; i < keys.length; i++) rules[bounded(keys[i], 64)] = Math.max(0, parseInt(e.rules[keys[i]], 10) || 0)
     }
-    var action = ["allowed", "redacted", "blocked"].indexOf(e.action) >= 0 ? e.action : "allowed"
+    var action = ["allowed", "redacted"].indexOf(e.action) >= 0 ? e.action : "allowed"
     var attachments = Array.isArray(e.attachments) ? e.attachments.slice(0, 20).map(function(a) {
       var kind = ["image", "pdf", "document", "file"].indexOf(a.kind) >= 0 ? a.kind : "file"
       return { kind: kind, media: bounded(a.media, 80), bytes: Math.max(0, Number(a.bytes) || 0),
@@ -141,7 +140,6 @@ Item {
     counts = {
       allowed: Math.max(0, parseInt(c.allowed, 10) || 0),
       redacted: Math.max(0, parseInt(c.redacted, 10) || 0),
-      blocked: Math.max(0, parseInt(c.blocked, 10) || 0),
       attachments: Math.max(0, parseInt(c.attachments, 10) || 0)
     }
     var list = Array.isArray(parsed.recent) ? parsed.recent.slice(0, 40).map(sanitize) : []
@@ -150,25 +148,19 @@ Item {
     recent = list
   }
 
-  // Flash the bar icon and notify for redactions and blocks that are new since
+  // Flash the bar icon and notify for redactions and attachments that are new since
   // the last update. The first update only sets the baseline.
   function announce(list) {
     var newest = list.length > 0 ? list[0].time : 0
     if (_lastSeen === 0) { _lastSeen = newest || 1; return }
     var fresh = list.filter(function(e) { return e.time > root._lastSeen })
     if (newest > _lastSeen) _lastSeen = newest
-    var blocked = fresh.filter(function(e) { return e.action === "blocked" && !e.test })
     var redacted = fresh.filter(function(e) { return e.action === "redacted" && !e.test })
     var files = []
     fresh.forEach(function(e) { if (!e.test) files = files.concat(e.attachments) })
     if (files.length > 0 && notifyAttachments && !panelOpen)
       notify("normal", t("notify.attachments"), attachmentsSummary(files))
-    if (blocked.length > 0) {
-      flash = "blocked"
-      flashTimer.restart()
-      if (notifyBlocked && !panelOpen)
-        notify("critical", t("notify.blocked"), blocked[0].reason || blocked[0].host)
-    } else if (redacted.length > 0 || files.length > 0) {
+    if (redacted.length > 0 || files.length > 0) {
       flash = redacted.length > 0 ? "redacted" : "attachment"
       flashTimer.restart()
       var now = Date.now()

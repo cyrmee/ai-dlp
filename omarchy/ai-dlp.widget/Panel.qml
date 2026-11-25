@@ -6,8 +6,8 @@ import qs.Commons as Commons
 import qs.Ui
 
 // Bar widget for the ai-dlp proxy. The shield shows whether traffic to
-// Anthropic is being inspected and lights up for a moment whenever secrets are
-// redacted or an image/PDF is sent (accent) or a request is blocked (urgent).
+// AI services is being inspected and lights up for a moment (accent) whenever
+// secrets are redacted or an image/PDF is sent; it turns urgent if the proxy is down.
 // Left click opens the live request list, right click switches inspection on
 // or off, middle click re-reads the state.
 Panel {
@@ -23,7 +23,7 @@ Panel {
   readonly property color faint: Qt.darker(foreground, 1.9)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   property bool cursorActive: false
-  // "all", "flagged", or one category: "allowed", "redacted", "blocked", "attachments".
+  // "all", "flagged", or one category: "allowed", "redacted", "attachments".
   property string filter: dlp.showAllowedSetting ? "all" : "flagged"
   // The request shown in the detail view (an event), or null for the lists.
   property var detailEntry: null
@@ -88,13 +88,11 @@ Panel {
   }
 
   function toneFor(action) {
-    if (action === "blocked") return root.urgent
     if (action === "redacted" || action === "attachments") return root.accent
     return root.dim
   }
 
   function actionGlyph(action) {
-    if (action === "blocked") return "󰅙"   // close-circle
     if (action === "redacted") return "󰈉"  // eye-off
     return "󰄬"                             // check
   }
@@ -152,7 +150,7 @@ Panel {
     text: root.glyph
     tooltipText: strings.t("title") + " · " + root.stateText
     active: dlp.flash !== "" || dlp.status === "proxyDown"
-    activeColor: dlp.flash === "redacted" || dlp.flash === "attachment" ? root.accent : root.urgent
+    activeColor: dlp.flash !== "" ? root.accent : root.urgent
     opacity: dlp.busy ? pulse.value : (dlp.status === "on" || dlp.status === "proxyDown" ? 1.0 : 0.45)
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) dlp.toggle()
@@ -296,13 +294,12 @@ Panel {
             Grid {
               id: stats
               width: parent.width
-              columns: 4
+              columns: 3
               spacing: Style.spacing.xs
               readonly property real cellWidth: (width - spacing * (columns - 1)) / columns
 
               StatTile { width: stats.cellWidth; action: "allowed"; value: dlp.counts.allowed }
               StatTile { width: stats.cellWidth; action: "redacted"; value: dlp.counts.redacted }
-              StatTile { width: stats.cellWidth; action: "blocked"; value: dlp.counts.blocked }
               StatTile { width: stats.cellWidth; action: "attachments"; value: dlp.counts.attachments }
             }
           }
@@ -424,7 +421,6 @@ Panel {
 
     Caption {
       text: [dv.entry.host, strings.t("action." + (dv.entry.action || "allowed")), root.agoText(dv.entry.time || 0)]
-        .concat(dv.entry.action === "blocked" && dv.entry.reason ? [dv.entry.reason] : [])
         .concat(dv.entry.action === "redacted" ? [dlp.rulesText(dv.entry.rules)] : []).join(" · ")
       color: root.dim
     }
@@ -452,9 +448,9 @@ Panel {
 
       Caption {
         visible: dv.d !== null && dv.d.changes.length === 0
-        text: !dv.d ? "" : (!dv.d.stored ? strings.t("detail.blockedBody")
+        text: !dv.d ? "" : (!dv.d.stored ? strings.t("detail.bodyNotStored")
           : (dv.entry.action === "allowed" ? strings.t("detail.nothingRedacted") : strings.t("detail.noPreview")))
-        color: dv.d && !dv.d.stored ? root.urgent : root.dim
+        color: root.dim
       }
 
       Repeater {
@@ -577,7 +573,7 @@ Panel {
   }
 
   // One request: a status glyph, the path with host/size underneath, any
-  // rules, block reason or attachments below that, and the time on the right.
+  // rules, notes or attachments below that, and the time on the right.
   component EventRow: Item {
     id: row
     property var entry: ({})
@@ -671,8 +667,7 @@ Panel {
           Layout.fillWidth: true
           visible: text !== ""
           textFormat: Text.PlainText
-          text: row.entry.action === "blocked" ? row.entry.reason
-            : (row.entry.action === "redacted" ? strings.t("detail.redacted").arg(dlp.rulesText(row.entry.rules)) : "")
+          text: row.entry.action === "redacted" ? strings.t("detail.redacted").arg(dlp.rulesText(row.entry.rules)) : ""
           color: row.tone
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

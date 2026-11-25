@@ -1087,7 +1087,8 @@ class HiddenNameTests(unittest.TestCase):
         self.addon.ai_addresses.add("160.79.104.10")
         self.assertEqual(self.decide(None, "160.79.104.10"), "intercept")
         self.assertEqual(self.decide("public.ech-frontend.example", "160.79.104.10", ech=True), "intercept")
-        self.assertIn("forced through inspection", EVENTS.read_text())
+        # Journal only: no "blocked" event, since nothing is blocked; its requests are logged.
+        self.assertFalse(EVENTS.exists() and "blocked" in EVENTS.read_text())
 
     def test_other_connections_still_pass_through(self):
         self.addon.ai_addresses.add("160.79.104.10")

@@ -6,7 +6,7 @@
   dlpwatch detail ID    print what was redacted in one stored request:
                         {method, host, path, changes: [{rule, before, after, count}], total, file}
 
-State: {installed, proxy, firewall, counts: {allowed, redacted, blocked, attachments} (today),
+State: {installed, proxy, firewall, counts: {allowed, redacted, attachments} (today),
         recent: [newest-first events, at most RECENT], error}
 
 Only reads the proxy's event log (action, host, path, rule names and counts;
@@ -32,7 +32,8 @@ REDACTION = re.compile(r"\[REDACTED:([A-Za-z0-9_.\-]{1,64})\]")
 REQUEST_ID = re.compile(r"^\d{13}-[0-9a-f]{8}$")
 POLL = 0.5
 STATUS_EVERY = 5.0
-ACTIONS = ("allowed", "redacted", "blocked")
+# Older versions also logged "blocked"; nothing is blocked any more, so those lines are skipped.
+ACTIONS = ("allowed", "redacted")
 
 
 def bounded(value, limit):

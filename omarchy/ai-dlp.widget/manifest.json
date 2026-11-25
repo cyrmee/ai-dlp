@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ai-dlp.widget",
   "name": "AI DLP",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "ai-dlp",
   "license": "MIT",
-  "description": "Watch the ai-dlp proxy: every request to Anthropic as it is allowed, has secrets redacted, or is blocked, flag images and PDFs sent to Claude, and turn inspection on or off.",
+  "description": "Watch the ai-dlp proxy: every request to an AI service as it is allowed or has secrets redacted, images and PDFs sent, and turn inspection on or off.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,21 +14,20 @@
   },
   "barWidget": {
     "displayName": "AI DLP",
-    "description": "Live view of secret redaction on traffic to Anthropic, with an on/off switch.",
+    "description": "Live view of secret redaction on traffic to AI services, with an on/off switch.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "showAllowed": true,
       "notifyRedacted": true,
-      "notifyBlocked": true,
       "notifyAttachments": true
     },
     "schema": [
       {
         "key": "showAllowed",
         "type": "boolean",
-        "label": "List allowed requests too (not only redacted and blocked ones)",
+        "label": "List allowed requests too (not only redacted ones and attachments)",
         "defaultValue": true
       },
       {
@@ -38,15 +37,9 @@
         "defaultValue": true
       },
       {
-        "key": "notifyBlocked",
-        "type": "boolean",
-        "label": "Notify when a request is blocked",
-        "defaultValue": true
-      },
-      {
         "key": "notifyAttachments",
         "type": "boolean",
-        "label": "Notify when an image or PDF is sent to Claude (cannot be scanned for secrets)",
+        "label": "Notify when an image or PDF is sent to an AI service",
         "defaultValue": true
       }
     ]

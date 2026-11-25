@@ -20,7 +20,7 @@ ai-dlp: redact secrets from everything sent to AI services
   ai-dlp on                  start the proxy (captures all apps; listed domains are inspected)
   ai-dlp off                 stop the proxy (AI traffic goes out unscanned!)
   ai-dlp test [--claude]     check redaction, passthrough of other sites, and Claude Code
-  ai-dlp log                 follow redaction/block events
+  ai-dlp log                 follow redaction and attachment events
   ai-dlp add-secrets FILE…   add secret values (.env files; --pgpass FILE; or stdin)
 EOF
 }

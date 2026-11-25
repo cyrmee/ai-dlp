@@ -19,14 +19,14 @@ newlines, as gitleaks expects); results are cached per string, so the unchanged
 conversation history Claude Code resends every turn is not rescanned.
 
 Every match is replaced with "[REDACTED:<rule-id>]" before the request leaves the
-machine. If a body cannot be scanned (gitleaks error, undecodable encoding, or a
-finding that cannot be located, e.g. an encoded secret), the request is blocked
-instead: nothing unscanned is ever forwarded. Secret values are never logged.
+machine. Nothing is ever blocked: a finding that cannot be replaced in place is
+removed by rebuilding the body (JSON, form or multipart re-encoded); if gitleaks
+fails, built-in rules are used; anything still holding a secret is replaced by a
+note. Secret values are never logged.
 
-Images, PDFs and other files sent to Anthropic cannot be scanned for text, so
-they are flagged instead: each one is recorded in the event log ("attachments")
-the first time it is sent. Claude Code resends the whole conversation every
-turn, so already-seen attachments are not flagged again.
+Images and PDFs are read (text layer and OCR); one holding a secret is replaced by a
+note. Each is recorded in the event log ("attachments") the first time it is sent;
+agents resend the whole conversation every turn, so seen ones are not recorded again.
 
 A request with the header "x-ai-dlp-echo: 1" is answered locally with the
 redacted body and never forwarded (used by `ai-dlp test`).
@@ -106,7 +106,7 @@ log = logging.getLogger("ai-dlp")
 
 
 class ScanError(Exception):
-    """The body could not be scanned reliably; the request must be blocked."""
+    """Content could not be scanned reliably (the caller falls back, never blocks)."""
 
 
 def placeholder(rule: str) -> bytes:
@@ -613,7 +613,7 @@ def _bytes_views(raw: bytes, media: str) -> list[str]:
 
     Images and PDFs (recognised by their bytes, not the declared type): their readable
     text runs. Text: the text. Audio and video: nothing (flagged as attachments; voice
-    features keep working). Any other binary content: ScanError, so the request is blocked.
+    features keep working). Any other binary content: its readable text runs, with a note.
     """
     media = (media or "").lower().split(";")[0].strip()
     if _is_image_or_pdf(raw[:16]):
@@ -658,8 +658,8 @@ def json_strings(obj, out: list[str], in_tools: bool = False, top: bool = True) 
 
     Every value of a duplicated key is collected: a server may read a different copy
     than Python's json would keep. Base64 payloads are decoded and scanned through
-    _bytes_views (a finding inside one cannot be rewritten in place, so the request is
-    then blocked); images and PDFs are also flagged as attachments.
+    _bytes_views (a finding inside one is removed by rebuilding the body); images and
+    PDFs are also flagged as attachments.
     """
     if isinstance(obj, str):
         if len(obj) >= MIN_LEN:
@@ -1307,7 +1307,7 @@ def _address_ip(conn) -> str | None:
 
 # Stored copies of inspected requests, for the widget's detail view. Off unless
 # AI_DLP_KEEP_REQUESTS is set (the Linux service keeps the last 50). Only what actually
-# left the machine is stored (redacted), never a blocked body; login headers are masked.
+# left the machine is stored (redacted); login headers are masked.
 REQUESTS_DIR = Path(os.environ.get("AI_DLP_REQUESTS_DIR", LOG_DIR / "requests"))
 KEEP_REQUESTS = int(os.environ.get("AI_DLP_KEEP_REQUESTS", "0") or 0)
 REQUEST_MAX_BYTES = 1_000_000
@@ -1538,30 +1538,14 @@ class AiDLP:
         ech = any(ext[0] == ECH_EXTENSION for ext in (getattr(hello, "extensions", None) or []))
         if ip and ip in self.ai_addresses and (not hello.sni or ech):
             why = "Encrypted Client Hello" if ech else "no server name"
+            # Journal only: its requests are inspected and logged like any other.
             log.warning("ai-dlp: forcing inspection of a connection to AI address %s (%s)", ip, why)
-            record_event("blocked", hello.sni or ip, "/", "TLS",
-                         reason=f"{why} on a connection to an AI service address: forced through inspection")
             return
         data.ignore_connection = True
 
     def _may_store(self, flow) -> bool:
         """Keep a copy only of requests from the account the installer gave access to."""
         return KEEP_REQUESTS > 0 and REQUESTS_UID >= 0 and client_uid(flow) == REQUESTS_UID
-
-    def _block(self, flow, reason: str) -> None:
-        body = json.dumps({"type": "error", "error": {
-            "type": "invalid_request_error", "message": f"ai-dlp blocked this request: {reason}"}})
-        flow.response = http.Response.make(400, body, {"content-type": "application/json"})
-        req = flow.request
-        rid = None
-        try:  # headers only: a blocked body holds the secret that could not be removed
-            if self._may_store(flow):
-                rid = store_request(req.method, req.pretty_host, req.path,
-                                    safe_headers(req.headers.fields, self.secrets.current()), None)
-        except Exception as e:
-            log.warning("ai-dlp: could not store request details: %s", e)
-        record_event("blocked", req.pretty_host, req.path, req.method, reason=reason,
-                     test=req.headers.get(ECHO_HEADER) == "1", request_id=rid)
 
     def _inspected(self, flow) -> bool:
         """Scan when the connection was opened to a listed name (TLS SNI) OR the request
