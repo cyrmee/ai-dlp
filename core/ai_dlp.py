@@ -627,8 +627,8 @@ def _bytes_views(raw: bytes, media: str) -> list[str]:
         pass
     if media.startswith(("audio/", "video/")):
         return []
-    _note(f"sent without being scanned: binary content ({media or 'unknown type'})")
-    return []
+    _note(f"binary content ({media or 'unknown type'}) sent; only its readable text was scanned")
+    return [_readable_runs(raw)]
 
 
 def _multipart_views(body: bytes, content_type: str) -> list[str]:
@@ -1150,9 +1150,38 @@ async def _redact(body, known, gitleaks, content_type, ocr, notes):
         rebuilt = replace_all(original, secrets, counts)
     left = remaining(rebuilt)
     if left:
-        log.warning("ai-dlp: could not remove every finding (%s); sent with the rest redacted", ", ".join(left))
-        _note(f"could not fully redact: {', '.join(sorted(set(left)))}")
+        # Last resort, never forwarding a secret that was found: every value still holding
+        # one is replaced by a removal note (for a non-JSON body, the whole body).
+        rules = sorted(set(left))
+        note = f"[REDACTED: content removed by ai-dlp, it contained {', '.join(rules)}]"
+        left_secrets = [(r, sec) for r, sec in secrets if r in rules]
+        log.warning("ai-dlp: could not redact %s in place; removed the content holding it", ", ".join(rules))
+        _note(f"removed content holding {', '.join(rules)} (it could not be redacted in place)")
+        if _valid_json(rebuilt):
+            rebuilt = json.dumps(_scrub(json.loads(rebuilt), left_secrets, note), ensure_ascii=False,
+                                 separators=(",", ":")).encode()
+        if not _valid_json(rebuilt) or remaining(rebuilt):
+            rebuilt = note.encode()
+        for r in rules:
+            counts[r] += 1
     return rebuilt, counts
+
+
+def _scrub(obj, secrets, note: str):
+    """Replace every string that still holds one of these secrets (as text, or as decoded
+    base64 content) by the note."""
+    if isinstance(obj, dict):
+        return {k: _scrub(v, secrets, note) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub(v, secrets, note) for v in obj]
+    if isinstance(obj, str):
+        views = [obj]
+        if len(obj) >= 8 and _is_base64(obj):
+            raw = base64.b64decode(obj)
+            views += [raw.decode("utf-8", errors="ignore"), _readable_runs(raw)]
+        if any(contains_secret(v, sec) for v in views for _, sec in secrets):
+            return note
+    return obj
 
 
 def _fallback_redact(body: bytes, known: list[str]) -> tuple[bytes, Counter]:
@@ -1163,8 +1192,9 @@ def _fallback_redact(body: bytes, known: list[str]) -> tuple[bytes, Counter]:
         secrets = [("known-secret", s) for s in known] + fallback_scan([text])
         return replace_all(body, secrets, counts), counts
     except Exception:
-        log.exception("ai-dlp: built-in rules failed too; request sent as is")
-        return body, counts
+        log.exception("ai-dlp: built-in rules failed too; request body replaced by a note")
+        counts["unscannable"] += 1
+        return b"[REDACTED: request content removed by ai-dlp, it could not be scanned]", counts
 
 
 def _summary(counts: Counter) -> str:
@@ -1551,9 +1581,19 @@ class AiDLP:
         try:
             content = req.get_content(strict=True) or b""
         except ValueError:
-            log.warning("ai-dlp: %s: undecodable content-encoding; sent without being scanned", where)
-            record_event("allowed", req.pretty_host, req.path, req.method,
-                         reason="sent without being scanned: undecodable content-encoding")
+            # Unknown compression: check whatever is readable in the raw bytes; if anything is
+            # found, replace the body (it cannot be rewritten while compressed).
+            raw = req.raw_content or b""
+            found = fallback_scan([_readable_runs(raw)]) + [
+                ("known-secret", k) for k in self.secrets.current() if contains_secret(_readable_runs(raw), k)]
+            if found:
+                req.raw_content = b"[REDACTED: request content removed by ai-dlp, it contained a secret]"
+                req.headers.pop("content-encoding", None)
+            log.warning("ai-dlp: %s: undecodable content-encoding; %s", where,
+                        "content removed" if found else "sent after a raw scan")
+            record_event("redacted" if found else "allowed", req.pretty_host, req.path, req.method,
+                         counts=Counter(r for r, _ in found) or None,
+                         notes=["undecodable content-encoding: " + ("content removed" if found else "only readable bytes scanned")])
             return
         try:
             cleaned, counts = await redact(content, self.secrets.current(), self.gitleaks,

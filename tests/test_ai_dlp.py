@@ -65,6 +65,21 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(counts["known-secret"], 1)
         json.loads(out)  # still valid JSON
 
+    def test_secret_that_survives_the_rebuild_is_removed_not_sent(self):
+        # Simulate a view the rebuild cannot rewrite: the secret only appears in a decoded view.
+        SECRETS.write_text("Zebra7731\n")
+        saved = dlp.texts_of
+        dlp.texts_of = lambda b, ct="": saved(b, ct) + (["Zebra7731"] if b"hidden-carrier" in b else [])
+        try:
+            body = json.dumps({"messages": [{"role": "user", "content": "hidden-carrier"}]}).encode()
+            notes = []
+            out, counts = run(dlp.redact(body, ["Zebra7731"], self.gl, "", None, notes))
+        finally:
+            dlp.texts_of = saved
+        self.assertNotIn(b"hidden-carrier", out)
+        self.assertIn(b"content removed by ai-dlp", out)
+        self.assertTrue(any("could not be redacted in place" in n for n in notes))
+
     def test_known_secret_hidden_by_json_unicode_escapes_is_redacted(self):
         secret = "s3cretValue" + rnd(10)
         SECRETS.write_text(secret + "\n")
@@ -236,7 +251,7 @@ class RedactTests(unittest.TestCase):
         notes = []
         out, counts = run(dlp.redact(body, [], self.gl, "", None, notes))
         self.assertEqual(out, body)
-        self.assertTrue(any("without being scanned" in n for n in notes))
+        self.assertTrue(any("only its readable text was scanned" in n for n in notes), notes)
 
     def test_secret_appended_to_a_real_png_removes_it(self):
         import base64 as b64
@@ -291,7 +306,7 @@ class RedactTests(unittest.TestCase):
         notes = []
         out, counts = run(dlp.redact(raw, self.secrets.current(), self.gl, "application/octet-stream", None, notes))
         self.assertEqual(out, raw)
-        self.assertTrue(any("without being scanned" in n for n in notes))
+        self.assertTrue(any("only its readable text was scanned" in n for n in notes), notes)
 
     def test_form_encoded_secret_is_redacted(self):
         from urllib.parse import parse_qsl
