@@ -927,6 +927,15 @@ class FaydaIdTests(unittest.TestCase):
         out, counts = self.redact(body)
         self.assertEqual(self.text_of(out), 'fixture {"fin":[REDACTED:fayda-fin-uin],"n":[1]} end')
 
+    def test_same_digits_inside_decimals_negatives_and_uuids_are_untouched(self):
+        body = json.dumps({"messages": [{"role": "user", "content": [{"type": "text",
+                           "text": "fin 123456789012 id 123e4567-e89b-12d3-a456-123456789012"}]}],
+                           "x": 0.123456789012, "y": -123456789012, "z": 123456789012}).encode()
+        out, counts = self.redact(body)
+        doc = json.loads(out)
+        self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin] id 123e4567-e89b-12d3-a456-123456789012")
+        self.assertEqual((doc["x"], doc["y"], doc["z"]), (0.123456789012, -123456789012, "[REDACTED:fayda-fin-uin]"))
+
     def test_same_digits_inside_a_longer_number_are_untouched(self):
         out, counts = self.redact(body_of("fin 123456789012 and ts 1123456789012"))
         self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin] and ts 1123456789012")

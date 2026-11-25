@@ -695,9 +695,12 @@ def _is_number(secret: str) -> bool:
 
 
 def _number_rx(value):
+    """The same boundaries as the ID-number rules: not next to letters, digits, '_' or '-',
+    not after '.', and not before '.' + digit. So the digits inside a decimal (0.123...),
+    a negative number, a UUID or a version are never touched."""
     if isinstance(value, bytes):
-        return re.compile(rb"(?<![0-9A-Za-z])" + re.escape(value) + rb"(?![0-9A-Za-z])")
-    return re.compile(r"(?<![0-9A-Za-z])" + re.escape(value) + r"(?![0-9A-Za-z])")
+        return re.compile(rb"(?<![0-9A-Za-z_.\-])" + re.escape(value) + rb"(?![0-9A-Za-z_\-]|\.[0-9])")
+    return re.compile(r"(?<![0-9A-Za-z_.\-])" + re.escape(value) + r"(?![0-9A-Za-z_\-]|\.[0-9])")
 
 
 def contains_secret(text: str, secret: str) -> bool:
@@ -822,6 +825,13 @@ async def redact(body: bytes, known: list[str], gitleaks: Gitleaks,
     was_json = _valid_json(body)
     body = replace_all(body, hits, counts)
     if was_json and not _valid_json(body):
+        try:
+            json.loads(body)
+        except ValueError as e:
+            pos = getattr(e, "pos", 0) or 0
+            near = re.sub(rb"[0-9]", b"#", body[max(0, pos - 60):pos + 40]).decode("utf-8", "replace")
+            log.warning("ai-dlp: redaction broke JSON at byte %d (%s); near (digits masked): %r",
+                        pos, getattr(e, "msg", e), near)
         raise ScanError("redaction would have produced invalid JSON")
     if hits:
         # A finding that is still present (in an encoding we did not rewrite) must not leave.
