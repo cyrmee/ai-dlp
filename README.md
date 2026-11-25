@@ -30,6 +30,8 @@ The core (`core/`) is the same everywhere; CI runs its tests on Linux, macOS and
    - against your own **exact secret values**;
    - with **[gitleaks](https://github.com/gitleaks/gitleaks)**: its full default rule set (about 200 credential formats, with keyword and entropy checks) plus extra rules for passwords in URLs and `password=` lines (values of 4+ characters; placeholders such as `null` or `<value>` are ignored).
 
+   **Fayda national ID numbers** are treated as personal data and redacted: registration IDs (RID, 29 digits), FIN/UIN (12 digits) and FAN/VID (16 digits), including in groups of four (`1234 5678 9012`) and as JSON numbers. They are matched only as stand-alone numbers, so UUIDs, timestamps and longer numbers are left alone.
+
    Listed values shorter than 8 characters only match as whole words, so a short password does not redact every word containing it.
 
    **Images and PDFs** are read too. On Linux, OCR is done with [tesseract](https://github.com/tesseract-ocr/tesseract), PDFs' text layers with poppler, and scanned PDF pages with OCR. Elsewhere, only the readable text inside the file is checked. A secret found inside an image or PDF cannot be blacked out in the file, so that request is blocked. Results are cached, so a resent conversation is not OCR'd again.

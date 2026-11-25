@@ -883,6 +883,48 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(make_ca.verify_ca_cert(out.read_bytes(), dlp.ca_domains(DOMAINS.read_text())), [])
 
 
+class FaydaIdTests(unittest.TestCase):
+    def setUp(self):
+        SECRETS.write_text("")
+        self.gl = dlp.Gitleaks()
+
+    def redact(self, body):
+        return run(dlp.redact(body, [], self.gl))
+
+    def text_of(self, out):
+        return json.loads(out)["messages"][0]["content"][0]["text"]
+
+    def test_each_id_type_is_redacted(self):
+        cases = {"fin 123456789012.": "fin [REDACTED:fayda-fin-uin].",
+                 "uin: 987654321098": "uin: [REDACTED:fayda-fin-uin]",
+                 "vid 1234567812345678": "vid [REDACTED:fayda-fan-vid]",
+                 "FAN 1234 5678 9012 3456 ok": "FAN [REDACTED:fayda-fan-vid] ok",
+                 "fin 1111-2222-3333": "fin [REDACTED:fayda-fin-uin]",
+                 "regid 10001100010001120251125103000": "regid [REDACTED:fayda-regid]"}
+        for text, want in cases.items():
+            out, counts = self.redact(body_of(text))
+            self.assertEqual(self.text_of(out), want, text)
+
+    def test_look_alikes_are_left_alone(self):
+        for text in ("ts 1795612345123", "id 123e4567-e89b-12d3-a456-426614174000",
+                     "toolu_01ab123456789012cd", "v1.123456789012", "0.123456789012345",
+                     "n 12345678901234567890"):
+            body = body_of(text)
+            out, counts = self.redact(body)
+            self.assertEqual(out, body, text)
+
+    def test_json_number_becomes_a_quoted_marker(self):
+        body = b'{"messages":[{"role":"user","content":"look up this person"}],"fin":123456789012,"n":[1795612345123]}'
+        out, counts = self.redact(body)
+        doc = json.loads(out)  # still valid JSON
+        self.assertEqual(doc["fin"], "[REDACTED:fayda-fin-uin]")
+        self.assertEqual(doc["n"], [1795612345123])
+
+    def test_same_digits_inside_a_longer_number_are_untouched(self):
+        out, counts = self.redact(body_of("fin 123456789012 and ts 1123456789012"))
+        self.assertEqual(self.text_of(out), "fin [REDACTED:fayda-fin-uin] and ts 1123456789012")
+
+
 class HiddenNameTests(unittest.TestCase):
     def setUp(self):
         DOMAINS.write_text("anthropic.com\n")

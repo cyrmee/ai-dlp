@@ -607,6 +607,9 @@ def json_strings(obj, out: list[str]) -> None:
     if isinstance(obj, str):
         if len(obj) >= MIN_LEN:
             out.append(obj)
+    elif isinstance(obj, int) and not isinstance(obj, bool):
+        if obj >= 10 ** (MIN_LEN - 1):  # ID numbers sent as JSON numbers
+            out.append(str(obj))
     elif isinstance(obj, _Pairs):
         keys = [k for k, _ in obj]
         unique = dict(obj) if len(set(keys)) == len(keys) else None
@@ -682,16 +685,56 @@ def _without_markers(text: str, labels) -> str:
     return marker.sub(" ", text)
 
 
+_DIGITS = re.compile(r"[0-9][0-9 \-]*[0-9]")
+
+
+def _is_number(secret: str) -> bool:
+    """ID numbers and the like: matched only where they stand alone, never as part of a
+    longer number or word (so a FIN's digits inside a timestamp are left alone)."""
+    return _DIGITS.fullmatch(secret) is not None
+
+
+def _number_rx(value):
+    if isinstance(value, bytes):
+        return re.compile(rb"(?<![0-9A-Za-z])" + re.escape(value) + rb"(?![0-9A-Za-z])")
+    return re.compile(r"(?<![0-9A-Za-z])" + re.escape(value) + r"(?![0-9A-Za-z])")
+
+
 def contains_secret(text: str, secret: str) -> bool:
+    if _is_number(secret):
+        return _number_rx(secret).search(text) is not None
     if len(secret) >= SHORT_LEN:
         return secret in text
     return _word_rx(secret).search(text) is not None
+
+
+def _replace_number(body: bytes, secret: str, mark: bytes) -> tuple[bytes, int]:
+    """Replace a stand-alone number. Where it is a bare JSON number ("fin": 123456789012)
+    the marker is quoted, so the request stays valid JSON."""
+    forms = {secret.encode(), quote(secret, safe="").encode(), quote_plus(secret, safe="").encode()}
+
+    def sub(m: re.Match[bytes]) -> bytes:
+        before = m.string[:m.start()].rstrip()
+        after = m.string[m.end():].lstrip()
+        bare = before[-1:] in (b":", b"[", b",") and after[:1] in (b",", b"}", b"]")
+        return b'"' + mark + b'"' if bare else mark
+    total = 0
+    for form in forms:
+        body, n = _number_rx(form).subn(sub, body)
+        total += n
+    return body, total
 
 
 def replace_all(body: bytes, hits: list[tuple[str, str]], counts: Counter) -> bytes:
     """Replace every encoding of each secret in the raw body (short ones as whole words)."""
     for rule, secret in hits:
         found = 0
+        if _is_number(secret):
+            body, n = _replace_number(body, secret, placeholder(rule))
+            found += n
+            if found:
+                counts[rule] += found
+            continue
         for form in encodings(secret):
             if len(secret) >= SHORT_LEN:
                 n = body.count(form)
